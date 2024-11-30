@@ -1,0 +1,17 @@
+#PBS -q ai
+#PBS -l walltime=168:00:00
+#PBS -l select=1:ncpus=6:ngpus=1:mem=200gb
+#PBS -N wsl_sol_dividemix
+#PBS -o /home/tanyang/workspace/ProtWSL/log
+#PBS -e /home/tanyang/workspace/ProtWSL/log
+
+zsh
+source ~/.zshrc
+cd /home/tanyang/workspace/ProtWSL
+conda activate protrem
+
+python dividemix_protein.py \
+    --seed 42 \
+    --warmup_epochs 5 \
+    --lr 0.001 \
+    --output_dir ckpt/s42_ExternalTest_we5_lr1e3
