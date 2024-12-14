@@ -1,17 +1,24 @@
 #PBS -q ai
 #PBS -l walltime=168:00:00
-#PBS -l select=1:ncpus=6:ngpus=1:mem=200gb
-#PBS -N wsl_sol_dividemix
-#PBS -o /home/tanyang/workspace/ProtWSL/log
-#PBS -e /home/tanyang/workspace/ProtWSL/log
+#PBS -l select=1:ncpus=6:ngpus=1:mem=100gb
+#PBS -N wsl_we1_lr1e3
+#PBS -o /home/tanyang/workspace/ProCalib/log
+#PBS -e /home/tanyang/workspace/ProCalib/log
 
 zsh
 source ~/.zshrc
-cd /home/tanyang/workspace/ProtWSL
+cd /home/tanyang/workspace/ProCalib
 conda activate protrem
 
-python dividemix_protein.py \
+export HF_ENDPOINT=https://hf-mirror.com
+warmup_epochs=1
+lr=0.001
+CUDA_VISIBLE_DEVICES=0 python train_dividemix_protein.py \
     --seed 42 \
-    --warmup_epochs 5 \
-    --lr 0.001 \
-    --output_dir ckpt/s42_ExternalTest_we5_lr1e3
+    --batch_size 4 \
+    --gradient_accumulation_steps 32 \
+    --num_epochs 50 \
+    --warmup_epochs ${warmup_epochs} \
+    --lr ${lr} \
+    --test_file test.csv \
+    --output_dir ckpt/esm2-650m_s42_we${warmup_epochs}_lr${lr}_adamw

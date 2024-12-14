@@ -7,12 +7,17 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import random
 import os
+import gc
 import argparse
 import numpy as np
 import pandas as pd
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import Dataset, DataLoader
 from accelerate.utils import set_seed
+from transformers import EsmTokenizer, EsmModel
+from src.models.pooling import Attention1dPoolingHead
+
+
 
 class ProteinDataset(Dataset):
     def __init__(self, csv_file, mode='train', pred=[], prob=[]):
@@ -20,7 +25,7 @@ class ProteinDataset(Dataset):
         self.mode = mode
         self.pred = pred
         self.prob = prob
-        
+                
         # 氨基酸映射字典
         self.aa_to_idx = {
             'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4,
@@ -29,6 +34,7 @@ class ProteinDataset(Dataset):
             'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
             'X': 20  # 未知氨基酸
         }
+        self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t30_150M_UR50D')
         
         if mode == 'train':
             if len(pred) > 0:
@@ -39,33 +45,35 @@ class ProteinDataset(Dataset):
         return len(self.data)
         
     def __getitem__(self, idx):
+        max_len = 1024
         sequence = self.data.iloc[idx]['aa_seq']
         label = self.data.iloc[idx]['label']
         
-        # 序列转换为索引
-        seq_idx = [self.aa_to_idx.get(aa, self.aa_to_idx['X']) for aa in sequence]
-        seq_idx = torch.tensor(seq_idx)
-        
-        # 填充或截断到固定长度
-        max_len = 1024
-        if len(seq_idx) > max_len:
-            seq_idx = seq_idx[:max_len]
-        else:
-            pad_len = max_len - len(seq_idx)
-            seq_idx = F.pad(seq_idx, (0, pad_len), value=self.aa_to_idx['X'])
+        # 使用tokenizer的padding功能
+        inputs = self.tokenizer(
+            sequence,
+            padding='max_length',
+            max_length=max_len,
+            truncation=True,
+            return_tensors='pt'
+        )
+        seq_idx = inputs.input_ids.squeeze(0)
+        attention_mask = inputs.attention_mask.squeeze(0)
             
         if self.mode == 'train':
             # 数据增强:随机mask
             seq_idx2 = seq_idx.clone()
-            mask = torch.rand(max_len) < 0.15
-            seq_idx2[mask] = self.aa_to_idx['X']
+            # 只对非padding token进行mask
+            attention_mask = inputs.attention_mask.squeeze(0)
+            mask = (torch.rand(max_len) < 0.15) & (attention_mask == 1)
+            seq_idx2[mask] = self.tokenizer.mask_token_id
             
             if len(self.pred) > 0:
-                return seq_idx, seq_idx2, label, self.probability[idx]
+                return seq_idx, seq_idx2, attention_mask, label, self.probability[idx]
             else:
-                return seq_idx, seq_idx2, label
+                return seq_idx, seq_idx2, attention_mask, label
         else:
-            return seq_idx, label
+            return seq_idx, attention_mask, label
 
 class ProteinDataLoader:
     def __init__(self, train_csv, val_csv, test_csv, batch_size, num_workers=4):
@@ -149,69 +157,66 @@ class ProteinDataLoader:
 
 def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader):
     net.train()
-    net2.eval() # fix one network and train the other
+    net2.eval()
     
     unlabeled_train_iter = iter(unlabeled_trainloader)    
     num_iter = (len(labeled_trainloader.dataset)//args.batch_size)+1
+    optimizer.zero_grad()
     
-    for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(labeled_trainloader):      
+    for batch_idx, (inputs_x, inputs_x2, attention_mask_x, labels_x, w_x) in enumerate(labeled_trainloader):      
         try:
             inputs_u_data = next(unlabeled_train_iter)
-            inputs_u, inputs_u2 = inputs_u_data[0], inputs_u_data[1]
-            # 确保unlabeled数据的batch size与labeled数据相同
+            inputs_u, inputs_u2, attention_mask_u = inputs_u_data[0], inputs_u_data[1], inputs_u_data[2]
             if inputs_u.size(0) != inputs_x.size(0):
                 continue
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
             inputs_u_data = next(unlabeled_train_iter)
-            inputs_u, inputs_u2 = inputs_u_data[0], inputs_u_data[1]
+            inputs_u, inputs_u2, attention_mask_u = inputs_u_data[0], inputs_u_data[1], inputs_u_data[2]
             if inputs_u.size(0) != inputs_x.size(0):
                 continue
         
         batch_size = inputs_x.size(0)
         
-        # Transform label to one-hot
         labels_x = torch.zeros(batch_size, args.num_labels).scatter_(1, labels_x.view(-1,1), 1)        
         w_x = w_x.view(-1,1).type(torch.FloatTensor) 
 
-        inputs_x, inputs_x2, labels_x, w_x = inputs_x.cuda(), inputs_x2.cuda(), labels_x.cuda(), w_x.cuda()
-        inputs_u, inputs_u2 = inputs_u.cuda(), inputs_u2.cuda()
+        inputs_x, inputs_x2, attention_mask_x, labels_x, w_x = inputs_x.cuda(), inputs_x2.cuda(), attention_mask_x.cuda(), labels_x.cuda(), w_x.cuda()
+        inputs_u, inputs_u2, attention_mask_u = inputs_u.cuda(), inputs_u2.cuda(), attention_mask_u.cuda()
 
         with torch.no_grad():
-            # label co-guessing of unlabeled samples
-            outputs_u11 = net(inputs_u)
-            outputs_u12 = net(inputs_u2)
-            outputs_u21 = net2(inputs_u)
-            outputs_u22 = net2(inputs_u2)            
+            outputs_u11 = net(inputs_u, attention_mask_u, plm_model)
+            outputs_u12 = net(inputs_u2, attention_mask_u, plm_model)
+            outputs_u21 = net2(inputs_u, attention_mask_u, plm_model)
+            outputs_u22 = net2(inputs_u2, attention_mask_u, plm_model)            
             
             pu = (torch.softmax(outputs_u11, dim=1) + torch.softmax(outputs_u12, dim=1) + torch.softmax(outputs_u21, dim=1) + torch.softmax(outputs_u22, dim=1)) / 4       
-            ptu = pu**(1/args.T) # temperature sharpening
+            ptu = pu**(1/args.T)
             
-            targets_u = ptu / ptu.sum(dim=1, keepdim=True) # normalize
+            targets_u = ptu / ptu.sum(dim=1, keepdim=True)
             targets_u = targets_u.detach()       
             
-            # label refinement of labeled samples
-            outputs_x = net(inputs_x)
-            outputs_x2 = net(inputs_x2)            
+            outputs_x = net(inputs_x, attention_mask_x, plm_model)
+            outputs_x2 = net(inputs_x2, attention_mask_x, plm_model)            
             
             px = (torch.softmax(outputs_x, dim=1) + torch.softmax(outputs_x2, dim=1)) / 2
             px = w_x*labels_x + (1-w_x)*px              
-            ptx = px**(1/args.T) # temperature sharpening 
+            ptx = px**(1/args.T)
                        
-            targets_x = ptx / ptx.sum(dim=1, keepdim=True) # normalize           
+            targets_x = ptx / ptx.sum(dim=1, keepdim=True)           
             targets_x = targets_x.detach()
         
         # mixmatch
         l = np.random.beta(args.alpha, args.alpha)        
         l = max(l, 1-l)
         
-        # 确保混合后的数据类型是LongTensor
         mixed_input = l * inputs_x + (1-l) * inputs_u
-        mixed_input = mixed_input.long()  # 转换为长整型
+        mixed_input = mixed_input.long()
+        mixed_attention_mask = l * attention_mask_x + (1-l) * attention_mask_u
         
         mixed_target = l * targets_x + (1-l) * targets_u
         
-        logits = net(mixed_input)
+        logits = net(mixed_input, mixed_attention_mask, plm_model)
         
         Lx = -torch.mean(torch.sum(F.log_softmax(logits, dim=1) * mixed_target, dim=1))
         
@@ -223,10 +228,13 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
 
         loss = Lx + penalty
         
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
+        # 梯度累积
+        loss = loss / args.gradient_accumulation_steps
         loss.backward()
-        optimizer.step()
+        
+        if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
         
         sys.stdout.write('\r')
         sys.stdout.write('Protein | Epoch [%3d/%3d] Iter[%3d/%3d]\t Labeled loss: %.4f'
@@ -235,16 +243,23 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
 
 def warmup(net, optimizer, dataloader):
     net.train()
-    for batch_idx, (inputs, labels) in enumerate(dataloader):      
-        inputs, labels = inputs.cuda(), labels.cuda() 
-        optimizer.zero_grad()
-        outputs = net(inputs)              
+    optimizer.zero_grad()  # 移到循环外部
+    
+    for batch_idx, (inputs, attention_mask, labels) in enumerate(dataloader):      
+        inputs, attention_mask, labels = inputs.cuda(), attention_mask.cuda(), labels.cuda() 
+        outputs = net(inputs, attention_mask, plm_model)              
         loss = CEloss(outputs, labels)  
         
         penalty = conf_penalty(outputs)
-        L = loss + penalty       
-        L.backward()  
-        optimizer.step() 
+        L = loss + penalty
+        
+        # 梯度累积
+        L = L / args.gradient_accumulation_steps
+        L.backward()
+        
+        if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         sys.stdout.write('\r')
         sys.stdout.write('| Warm-up: Iter[%3d/%3d]\t CE-loss: %.4f  Conf-Penalty: %.4f'
@@ -256,9 +271,9 @@ def val(net, val_loader):
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(val_loader):
-            inputs, targets = inputs.cuda(), targets.cuda()
-            outputs = net(inputs)
+        for batch_idx, (inputs, attention_mask, targets) in enumerate(val_loader):
+            inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
+            outputs = net(inputs, attention_mask, plm_model)
             _, predicted = torch.max(outputs, 1)         
                        
             total += targets.size(0)
@@ -272,10 +287,10 @@ def test(net1, net2, test_loader):
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs, targets = inputs.cuda(), targets.cuda()
-            outputs1 = net1(inputs)       
-            outputs2 = net2(inputs)           
+        for batch_idx, (inputs, attention_mask, targets) in enumerate(test_loader):
+            inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
+            outputs1 = net1(inputs, attention_mask, plm_model)       
+            outputs2 = net2(inputs, attention_mask, plm_model)           
             outputs = outputs1 + outputs2
             _, predicted = torch.max(outputs, 1)            
                        
@@ -289,9 +304,9 @@ def eval_train(net, eval_loader):
     net.eval()
     losses = torch.zeros(len(eval_loader.dataset))
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(eval_loader):
-            inputs, targets = inputs.cuda(), targets.cuda() 
-            outputs = net(inputs) 
+        for batch_idx, (inputs, attention_mask, targets) in enumerate(eval_loader):
+            inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda() 
+            outputs = net(inputs, attention_mask, plm_model) 
             loss = CE(outputs, targets)  
             for b in range(inputs.size(0)):
                 losses[batch_idx*args.batch_size+b] = loss[b]
@@ -314,10 +329,28 @@ class NegEntropy(object):
         probs = torch.softmax(outputs, dim=1)
         return torch.mean(torch.sum(probs.log()*probs, dim=1))
 
-class ProteinPredictor(nn.Module):
+class PredictorPLM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(21, 32)  # 21个氨基酸 + padding
+        self.classifier = Attention1dPoolingHead(1280, args.num_labels, 0.5)
+    
+    @torch.no_grad()
+    def plm_embedding(self, plm_model, aa_seq, attention_mask):
+        outputs = plm_model(input_ids=aa_seq, attention_mask=attention_mask)
+        seq_embeds = outputs.last_hidden_state
+        gc.collect()
+        torch.cuda.empty_cache()
+        return seq_embeds
+    
+    def forward(self, x, attention_mask, plm_model):
+        x = self.plm_embedding(plm_model, x, attention_mask)
+        x = self.classifier(x, attention_mask)
+        return x
+
+class PredictorConv(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(33, 32)
         self.conv1 = nn.Conv1d(32, 64, 3, padding=1)
         self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
         self.pool = nn.MaxPool1d(2)
@@ -325,7 +358,7 @@ class ProteinPredictor(nn.Module):
         self.fc2 = nn.Linear(256, args.num_labels)
         self.dropout = nn.Dropout(0.5)
         
-    def forward(self, x):
+    def forward(self, x, attention_mask, plm_model):
         x = self.embedding(x)  # [batch, seq_len, embed_dim]
         x = x.transpose(1, 2)  # [batch, embed_dim, seq_len]
         x = F.relu(self.conv1(x))
@@ -337,10 +370,40 @@ class ProteinPredictor(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x)
         return x
+    
+class PredictorPLMConv(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv1d(640, 64, 3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
+        self.pool = nn.MaxPool1d(2)
+        self.fc1 = nn.Linear(128*256, 256)
+        self.fc2 = nn.Linear(256, args.num_labels)
+        self.dropout = nn.Dropout(0.5)
+    
+    @torch.no_grad()
+    def plm_embedding(self, plm_model, aa_seq, attention_mask):
+        outputs = plm_model(input_ids=aa_seq, attention_mask=attention_mask)
+        seq_embeds = outputs.last_hidden_state
+        gc.collect()
+        torch.cuda.empty_cache()
+        return seq_embeds
+    
+    def forward(self, x, attention_mask, plm_model):
+        x = self.plm_embedding(plm_model, x, attention_mask)
+        x = x.transpose(1, 2)
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch Protein Solubility Training')
-    parser.add_argument('--batch_size', default=128, type=int, help='train batchsize') 
+    parser.add_argument('--batch_size', default=4, type=int, help='train batchsize') 
     parser.add_argument('--lr', default=0.0005, type=float, help='initial learning rate')
     parser.add_argument('--alpha', default=0.5, type=float, help='parameter for Beta')
     parser.add_argument('--lambda_u', default=0, type=float, help='weight for unsupervised loss')
@@ -349,22 +412,29 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', default=100, type=int, help='total epochs')
     parser.add_argument('--warmup_epochs', default=10, type=int, help='warmup epochs')
     parser.add_argument('--seed', default=42, type=int, help='random seed')
-    parser.add_argument('--gpuid', default=0, type=int, help='gpu id')
     parser.add_argument('--num_labels', default=2, type=int, help='number of classes')
     parser.add_argument('--dataset_dir', default='data/PDBSol', type=str, help='path to dataset')
     parser.add_argument('--test_file', default='ExternalTest.csv', type=str, help='test file')
     parser.add_argument('--id', default='protein')
     parser.add_argument('--output_dir', default='ckpt')
+    parser.add_argument('--gradient_accumulation_steps', default=32, type=int, help='gradient accumulation steps')
     args = parser.parse_args()
     
-    torch.cuda.set_device(args.gpuid)
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
-
+    
+    plm_model = EsmModel.from_pretrained('facebook/esm2_t33_650M_UR50D').cuda().eval()
+    
     # build model
     print('| Building net')
-    net1 = ProteinPredictor().cuda()
-    net2 = ProteinPredictor().cuda()
+    net1 = PredictorPLM().cuda()
+    net2 = PredictorPLM().cuda()
+    
+    # Print model parameters
+    total_params1 = sum(p.numel() for p in net1.parameters())
+    total_params2 = sum(p.numel() for p in net2.parameters())
+    print(f'Total parameters of net1: {total_params1/1e6:.2f}M')
+    print(f'Total parameters of net2: {total_params2/1e6:.2f}M')
     cudnn.benchmark = True
 
     optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr)
