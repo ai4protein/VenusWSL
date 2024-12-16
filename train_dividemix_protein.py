@@ -26,13 +26,12 @@ class ProteinDataset(Dataset):
         self.pred = pred
         self.prob = prob
                 
-        # 氨基酸映射字典
         self.aa_to_idx = {
             'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4,
             'G': 5, 'H': 6, 'I': 7, 'K': 8, 'L': 9,
             'M': 10, 'N': 11, 'P': 12, 'Q': 13, 'R': 14,
             'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
-            'X': 20  # 未知氨基酸
+            'X': 20
         }
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t30_150M_UR50D')
         
@@ -65,7 +64,7 @@ class ProteinDataset(Dataset):
             seq_idx2 = seq_idx.clone()
             # 只对非padding token进行mask
             attention_mask = inputs.attention_mask.squeeze(0)
-            mask = (torch.rand(max_len) < 0.15) & (attention_mask == 1)
+            mask = (torch.rand(max_len) < 0.05) & (attention_mask == 1)
             seq_idx2[mask] = self.tokenizer.mask_token_id
             
             if len(self.pred) > 0:
@@ -76,7 +75,7 @@ class ProteinDataset(Dataset):
             return seq_idx, attention_mask, label
 
 class ProteinDataLoader:
-    def __init__(self, train_csv, val_csv, test_csv, batch_size, num_workers=4):
+    def __init__(self, train_csv, val_csv, test_csv, batch_size, num_workers=6):
         self.train_csv = train_csv
         self.val_csv = val_csv
         self.test_csv = test_csv
@@ -155,7 +154,7 @@ class ProteinDataLoader:
             )
             return eval_loader
 
-def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader):
+def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader, unlabeled_trainloader):
     net.train()
     net2.eval()
     
@@ -185,10 +184,18 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
         inputs_u, inputs_u2, attention_mask_u = inputs_u.cuda(), inputs_u2.cuda(), attention_mask_u.cuda()
 
         with torch.no_grad():
-            outputs_u11 = net(inputs_u, attention_mask_u, plm_model)
-            outputs_u12 = net(inputs_u2, attention_mask_u, plm_model)
-            outputs_u21 = net2(inputs_u, attention_mask_u, plm_model)
-            outputs_u22 = net2(inputs_u2, attention_mask_u, plm_model)            
+            if 'plm' in net_type:
+                embed_u = plm_embedding(plm_model, inputs_u, attention_mask_u)
+                embed_u2 = plm_embedding(plm_model, inputs_u2, attention_mask_u)
+                outputs_u11 = net(embed_u, attention_mask_u)
+                outputs_u12 = net(embed_u2, attention_mask_u)
+                outputs_u21 = net2(embed_u, attention_mask_u)
+                outputs_u22 = net2(embed_u2, attention_mask_u)
+            else:
+                outputs_u11 = net(inputs_u)
+                outputs_u12 = net(inputs_u2)
+                outputs_u21 = net2(inputs_u)
+                outputs_u22 = net2(inputs_u2)            
             
             pu = (torch.softmax(outputs_u11, dim=1) + torch.softmax(outputs_u12, dim=1) + torch.softmax(outputs_u21, dim=1) + torch.softmax(outputs_u22, dim=1)) / 4       
             ptu = pu**(1/args.T)
@@ -196,8 +203,15 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
             targets_u = ptu / ptu.sum(dim=1, keepdim=True)
             targets_u = targets_u.detach()       
             
-            outputs_x = net(inputs_x, attention_mask_x, plm_model)
-            outputs_x2 = net(inputs_x2, attention_mask_x, plm_model)            
+            
+            if 'plm' in net_type:
+                embed_x = plm_embedding(plm_model, inputs_x, attention_mask_x)
+                embed_x2 = plm_embedding(plm_model, inputs_x2, attention_mask_x)
+                outputs_x = net(embed_x, attention_mask_x)
+                outputs_x2 = net(embed_x2, attention_mask_x)            
+            else:
+                outputs_x = net(inputs_x)
+                outputs_x2 = net(inputs_x2)            
             
             px = (torch.softmax(outputs_x, dim=1) + torch.softmax(outputs_x2, dim=1)) / 2
             px = w_x*labels_x + (1-w_x)*px              
@@ -216,7 +230,11 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
         
         mixed_target = l * targets_x + (1-l) * targets_u
         
-        logits = net(mixed_input, mixed_attention_mask, plm_model)
+        if 'plm' in args.net_type:
+            embed = plm_embedding(plm_model, mixed_input, mixed_attention_mask)
+            logits = net(embed, mixed_attention_mask)
+        else:
+            logits = net(mixed_input)
         
         Lx = -torch.mean(torch.sum(F.log_softmax(logits, dim=1) * mixed_target, dim=1))
         
@@ -241,13 +259,17 @@ def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloade
                 %(epoch, args.num_epochs, batch_idx+1, num_iter, Lx.item()))
         sys.stdout.flush()
 
-def warmup(net, optimizer, dataloader):
+def warmup(net, net_type, plm_model, optimizer, dataloader):
     net.train()
     optimizer.zero_grad()  # 移到循环外部
     
     for batch_idx, (inputs, attention_mask, labels) in enumerate(dataloader):      
-        inputs, attention_mask, labels = inputs.cuda(), attention_mask.cuda(), labels.cuda() 
-        outputs = net(inputs, attention_mask, plm_model)              
+        inputs, attention_mask, labels = inputs.cuda(), attention_mask.cuda(), labels.cuda()
+        if 'plm' in net_type:
+            embed = plm_embedding(plm_model, inputs, attention_mask)
+            outputs = net(embed, attention_mask)
+        else:
+            outputs = net(inputs)
         loss = CEloss(outputs, labels)  
         
         penalty = conf_penalty(outputs)
@@ -266,14 +288,18 @@ def warmup(net, optimizer, dataloader):
                 %(batch_idx+1, len(dataloader), loss.item(), penalty.item()))
         sys.stdout.flush()
 
-def val(net, val_loader):
+def val(net, net_type, plm_model, val_loader):
     net.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for batch_idx, (inputs, attention_mask, targets) in enumerate(val_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
-            outputs = net(inputs, attention_mask, plm_model)
+            if 'plm' in net_type:
+                embed = plm_embedding(plm_model, inputs, attention_mask)
+                outputs = net(embed, attention_mask)
+            else:
+                outputs = net(inputs)
             _, predicted = torch.max(outputs, 1)         
                        
             total += targets.size(0)
@@ -281,7 +307,7 @@ def val(net, val_loader):
     acc = 100.*correct/total
     return acc
 
-def test(net1, net2, test_loader):
+def test(net1, net2, net_type, plm_model, test_loader):
     net1.eval()
     net2.eval()
     correct = 0
@@ -289,8 +315,13 @@ def test(net1, net2, test_loader):
     with torch.no_grad():
         for batch_idx, (inputs, attention_mask, targets) in enumerate(test_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
-            outputs1 = net1(inputs, attention_mask, plm_model)       
-            outputs2 = net2(inputs, attention_mask, plm_model)           
+            if 'plm' in net_type:
+                embed = plm_embedding(plm_model, inputs, attention_mask)
+                outputs1 = net1(embed, attention_mask)       
+                outputs2 = net2(embed, attention_mask)           
+            else:
+                outputs1 = net1(inputs)       
+                outputs2 = net2(inputs)           
             outputs = outputs1 + outputs2
             _, predicted = torch.max(outputs, 1)            
                        
@@ -300,13 +331,18 @@ def test(net1, net2, test_loader):
     print("\n| Test Acc: %.2f%%\n" %(acc))  
     return acc
 
-def eval_train(net, eval_loader):
+@torch.no_grad()
+def eval_train(net, net_type, plm_model, eval_loader):
     net.eval()
     losses = torch.zeros(len(eval_loader.dataset))
     with torch.no_grad():
         for batch_idx, (inputs, attention_mask, targets) in enumerate(eval_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda() 
-            outputs = net(inputs, attention_mask, plm_model) 
+            if 'plm' in net_type:
+                embed = plm_embedding(plm_model, inputs, attention_mask)
+                outputs = net(embed, attention_mask) 
+            else:
+                outputs = net(inputs) 
             loss = CE(outputs, targets)  
             for b in range(inputs.size(0)):
                 losses[batch_idx*args.batch_size+b] = loss[b]
@@ -324,41 +360,42 @@ def eval_train(net, eval_loader):
     prob = prob[:,gmm.means_.argmin()]       
     return prob
 
+
+@torch.no_grad()
+def plm_embedding(plm_model, aa_seq, attention_mask):
+    outputs = plm_model(input_ids=aa_seq, attention_mask=attention_mask)
+    seq_embeds = outputs.last_hidden_state
+    gc.collect()
+    torch.cuda.empty_cache()
+    return seq_embeds
+
 class NegEntropy(object):
     def __call__(self,outputs):
         probs = torch.softmax(outputs, dim=1)
         return torch.mean(torch.sum(probs.log()*probs, dim=1))
 
 class PredictorPLM(nn.Module):
-    def __init__(self):
+    def __init__(self, plm_embed_dim, num_labels):
         super().__init__()
-        self.classifier = Attention1dPoolingHead(1280, args.num_labels, 0.5)
+        self.classifier = Attention1dPoolingHead(plm_embed_dim, num_labels, 0.5)
     
-    @torch.no_grad()
-    def plm_embedding(self, plm_model, aa_seq, attention_mask):
-        outputs = plm_model(input_ids=aa_seq, attention_mask=attention_mask)
-        seq_embeds = outputs.last_hidden_state
-        gc.collect()
-        torch.cuda.empty_cache()
-        return seq_embeds
-    
-    def forward(self, x, attention_mask, plm_model):
-        x = self.plm_embedding(plm_model, x, attention_mask)
+    # x is plm embedding
+    def forward(self, x, attention_mask):
         x = self.classifier(x, attention_mask)
         return x
 
 class PredictorConv(nn.Module):
-    def __init__(self):
+    def __init__(self, num_labels):
         super().__init__()
         self.embedding = nn.Embedding(33, 32)
         self.conv1 = nn.Conv1d(32, 64, 3, padding=1)
         self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
         self.pool = nn.MaxPool1d(2)
         self.fc1 = nn.Linear(128*256, 256)  # 1024/4 = 256 after 2 pooling layers
-        self.fc2 = nn.Linear(256, args.num_labels)
+        self.fc2 = nn.Linear(256, num_labels)
         self.dropout = nn.Dropout(0.5)
         
-    def forward(self, x, attention_mask, plm_model):
+    def forward(self, x):
         x = self.embedding(x)  # [batch, seq_len, embed_dim]
         x = x.transpose(1, 2)  # [batch, embed_dim, seq_len]
         x = F.relu(self.conv1(x))
@@ -370,27 +407,19 @@ class PredictorConv(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x)
         return x
-    
+
 class PredictorPLMConv(nn.Module):
-    def __init__(self):
+    def __init__(self, plm_embed_dim, num_labels):
         super().__init__()
-        self.conv1 = nn.Conv1d(640, 64, 3, padding=1)
+        self.conv1 = nn.Conv1d(plm_embed_dim, 64, 3, padding=1)
         self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
         self.pool = nn.MaxPool1d(2)
         self.fc1 = nn.Linear(128*256, 256)
-        self.fc2 = nn.Linear(256, args.num_labels)
+        self.fc2 = nn.Linear(256, num_labels)
         self.dropout = nn.Dropout(0.5)
     
-    @torch.no_grad()
-    def plm_embedding(self, plm_model, aa_seq, attention_mask):
-        outputs = plm_model(input_ids=aa_seq, attention_mask=attention_mask)
-        seq_embeds = outputs.last_hidden_state
-        gc.collect()
-        torch.cuda.empty_cache()
-        return seq_embeds
-    
-    def forward(self, x, attention_mask, plm_model):
-        x = self.plm_embedding(plm_model, x, attention_mask)
+    # x is plm embedding
+    def forward(self, x, attention_mask):
         x = x.transpose(1, 2)
         x = F.relu(self.conv1(x))
         x = self.pool(x)
@@ -402,7 +431,9 @@ class PredictorPLMConv(nn.Module):
         return x
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='PyTorch Protein Solubility Training')
+    parser = argparse.ArgumentParser(description='Protein Dividemix Training')
+    parser.add_argument('--plm_model', default='facebook/esm2_t33_650M_UR50D', type=str, help='PLM model')
+    parser.add_argument('--net_type', default='plm_attn1d', choices=['plm_attn1d', 'plm_conv', 'conv'], type=str, help='net type')
     parser.add_argument('--batch_size', default=4, type=int, help='train batchsize') 
     parser.add_argument('--lr', default=0.0005, type=float, help='initial learning rate')
     parser.add_argument('--alpha', default=0.5, type=float, help='parameter for Beta')
@@ -417,24 +448,41 @@ if __name__ == '__main__':
     parser.add_argument('--test_file', default='ExternalTest.csv', type=str, help='test file')
     parser.add_argument('--id', default='protein')
     parser.add_argument('--output_dir', default='ckpt')
-    parser.add_argument('--gradient_accumulation_steps', default=32, type=int, help='gradient accumulation steps')
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation steps')
     args = parser.parse_args()
     
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
+    log = open(f'{args.output_dir}/{args.id}.txt', 'w')
+    log.flush()
     
-    plm_model = EsmModel.from_pretrained('facebook/esm2_t33_650M_UR50D').cuda().eval()
+    if 'plm' in args.net_type:
+        plm_model = EsmModel.from_pretrained(args.plm_model).cuda().eval()
+    else:
+        plm_model = None
     
     # build model
     print('| Building net')
-    net1 = PredictorPLM().cuda()
-    net2 = PredictorPLM().cuda()
+    if args.net_type == 'plm_attn1d':
+        net1 = PredictorPLM(plm_model.config.hidden_size, args.num_labels)
+        net2 = PredictorPLM(plm_model.config.hidden_size, args.num_labels)
+    elif args.net_type == 'plm_conv':
+        net1 = PredictorPLMConv(plm_model.config.hidden_size, args.num_labels)
+        net2 = PredictorPLMConv(plm_model.config.hidden_size, args.num_labels)
+    elif args.net_type == 'conv':
+        net1 = PredictorConv(args.num_labels)
+        net2 = PredictorConv(args.num_labels)
+    net1 = net1.cuda()
+    net2 = net2.cuda()
     
     # Print model parameters
     total_params1 = sum(p.numel() for p in net1.parameters())
     total_params2 = sum(p.numel() for p in net2.parameters())
     print(f'Total parameters of net1: {total_params1/1e6:.2f}M')
     print(f'Total parameters of net2: {total_params2/1e6:.2f}M')
+    log.write(f'Total parameters of net1: {total_params1/1e6:.2f}M\n')
+    log.write(f'Total parameters of net2: {total_params2/1e6:.2f}M\n')
+    log.flush()
     cudnn.benchmark = True
 
     optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr)
@@ -454,32 +502,31 @@ if __name__ == '__main__':
         batch_size=args.batch_size
     )
 
-    log = open(f'{args.output_dir}/{args.id}.txt', 'w')
-    log.flush()
 
     for epoch in range(args.num_epochs+1):
-        if epoch < args.warmup_epochs:     # warmup
+        # warmup
+        if epoch < args.warmup_epochs:
             train_loader = loader.run('warmup')
             print('Warmup Net1')
-            warmup(net1, optimizer1, train_loader)     
+            warmup(net1, args.net_type, plm_model, optimizer1, train_loader)     
             train_loader = loader.run('warmup')
             print('\nWarmup Net2')
-            warmup(net2, optimizer2, train_loader)                 
+            warmup(net2, args.net_type, plm_model, optimizer2, train_loader)                 
         else:       
             pred1 = (prob1 > args.p_threshold)  
             pred2 = (prob2 > args.p_threshold)      
             
             print('\nTrain Net1')
             labeled_loader1, unlabeled_loader1 = loader.run('train', pred2, prob2)
-            train(epoch, net1, net2, optimizer1, labeled_loader1, unlabeled_loader1)
+            train(epoch, net1, net2, args.net_type, plm_model, optimizer1, labeled_loader1, unlabeled_loader1)
             
             print('\nTrain Net2')
             labeled_loader2, unlabeled_loader2 = loader.run('train', pred1, prob1)
-            train(epoch, net2, net1, optimizer2, labeled_loader2, unlabeled_loader2)
+            train(epoch, net2, net1, args.net_type, plm_model, optimizer2, labeled_loader2, unlabeled_loader2)
         
         # Validation
         val_loader = loader.run('val')
-        acc1 = val(net1, val_loader)
+        acc1 = val(net1, args.net_type, plm_model, val_loader)
         print("\n| Validation\t Net1  Acc: %.2f%%" %(acc1))
         # save best model
         if acc1 > best_acc[0]:
@@ -488,7 +535,7 @@ if __name__ == '__main__':
             best_acc[0] = acc1
         
         
-        acc2 = val(net2, val_loader)
+        acc2 = val(net2, args.net_type, plm_model, val_loader)
         print("\n| Validation\t Net2  Acc: %.2f%%" %(acc2))
         # save best model
         if acc2 > best_acc[1]:
@@ -501,14 +548,13 @@ if __name__ == '__main__':
         
         print('\n==== net 1 evaluate next epoch training data loss ====')
         eval_loader = loader.run('eval_train')
-        prob1 = eval_train(net1, eval_loader)
+        prob1 = eval_train(net1, args.net_type, plm_model, eval_loader)
         
         print('\n==== net 2 evaluate next epoch training data loss ====')
         eval_loader = loader.run('eval_train')
-        prob2 = eval_train(net2, eval_loader)
+        prob2 = eval_train(net2, args.net_type, plm_model, eval_loader)
 
         
-
     # Final test
     test_loader = loader.run('test')
     checkpoint1 = torch.load(f'{args.output_dir}/{args.id}_net1.pth.tar', weights_only=True)
@@ -516,7 +562,7 @@ if __name__ == '__main__':
 
     net1.load_state_dict(checkpoint1)
     net2.load_state_dict(checkpoint2)
-    acc = test(net1, net2, test_loader)
+    acc = test(net1, net2, args.net_type, plm_model, test_loader)
     
     log.write('Test %s Acc:%.2f\n'%(args.test_file, acc))
     log.close()

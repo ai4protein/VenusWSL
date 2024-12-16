@@ -13,14 +13,15 @@ CUDA_VISIBLE_DEVICES=0 python train_dividemix_protein.py \
 
 
 export HF_ENDPOINT=https://hf-mirror.com
-warmup_epochs=10
-lr=0.001
+warmup_epochs=1
+lr=0.002
 CUDA_VISIBLE_DEVICES=0 python train_dividemix_protein.py \
+    --net_type conv \
     --seed 42 \
-    --batch_size 4 \
-    --gradient_accumulation_steps 32 \
-    --num_epochs 100 \
+    --batch_size 96 \
+    --gradient_accumulation_steps 2 \
+    --num_epochs 20 \
     --warmup_epochs ${warmup_epochs} \
     --lr ${lr} \
     --test_file test.csv \
-    --output_dir ckpt/esm2-650m_s42_we${warmup_epochs}_lr${lr}_adamw
+    --output_dir ckpt/conv_s42_we${warmup_epochs}_lr${lr}_adamw
