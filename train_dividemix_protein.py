@@ -1,70 +1,58 @@
 from __future__ import print_function
 import sys
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-import random
 import os
 import gc
 import argparse
 import numpy as np
 import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+from tqdm import tqdm
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import Dataset, DataLoader
 from accelerate.utils import set_seed
 from transformers import EsmTokenizer, EsmModel
 from src.models.pooling import Attention1dPoolingHead
+from datasets import load_dataset, Dataset, DatasetDict
 
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, csv_file, mode='train', pred=[], prob=[]):
-        self.data = pd.read_csv(csv_file)
+    def __init__(self, tokenizer, max_seq_len, dataset, mode='train', pred=[], prob=[]):
+        self.dataset = dataset
         self.mode = mode
         self.pred = pred
         self.prob = prob
-                
-        self.aa_to_idx = {
-            'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4,
-            'G': 5, 'H': 6, 'I': 7, 'K': 8, 'L': 9,
-            'M': 10, 'N': 11, 'P': 12, 'Q': 13, 'R': 14,
-            'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
-            'X': 20
-        }
-        self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t30_150M_UR50D')
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
         
-        if mode == 'train':
-            if len(pred) > 0:
-                self.data = self.data[pred]
-                self.probability = prob[pred]
+        if mode == 'train' and len(pred) > 0:
+            # Filter dataset based on pred
+            indices = [i for i, p in enumerate(pred) if p]
+            self.dataset = self.dataset[indices]
+            self.probability = prob[pred]
             
     def __len__(self):
-        return len(self.data)
+        return len(self.dataset)
         
     def __getitem__(self, idx):
-        max_len = 1024
-        sequence = self.data.iloc[idx]['aa_seq']
-        label = self.data.iloc[idx]['label']
+        sequence = self.dataset[idx]['aa_seq']
+        label = self.dataset[idx]['label']
         
-        # 使用tokenizer的padding功能
         inputs = self.tokenizer(
-            sequence,
-            padding='max_length',
-            max_length=max_len,
-            truncation=True,
-            return_tensors='pt'
+            sequence, padding='max_length', max_length=self.max_seq_len,
+            truncation=True, return_tensors='pt'
         )
         seq_idx = inputs.input_ids.squeeze(0)
         attention_mask = inputs.attention_mask.squeeze(0)
             
         if self.mode == 'train':
-            # 数据增强:随机mask
             seq_idx2 = seq_idx.clone()
-            # 只对非padding token进行mask
             attention_mask = inputs.attention_mask.squeeze(0)
-            mask = (torch.rand(max_len) < 0.05) & (attention_mask == 1)
+            mask = (torch.rand(self.max_seq_len) < 0.05) & (attention_mask == 1)
             seq_idx2[mask] = self.tokenizer.mask_token_id
             
             if len(self.pred) > 0:
@@ -75,86 +63,69 @@ class ProteinDataset(Dataset):
             return seq_idx, attention_mask, label
 
 class ProteinDataLoader:
-    def __init__(self, train_csv, val_csv, test_csv, batch_size, num_workers=6):
-        self.train_csv = train_csv
-        self.val_csv = val_csv
-        self.test_csv = test_csv
+    def __init__(self, tokenizer, max_seq_len, dataset, batch_size, num_workers=6):
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self.num_workers = num_workers
-
+        self.dataset = dataset
+        
     def run(self, mode, pred=[], prob=[]):
         if mode == 'warmup':
-            warmup_dataset = ProteinDataset(self.train_csv, mode='warmup')
+            warmup_dataset = ProteinDataset(self.tokenizer, self.max_seq_len, self.dataset['train'], mode='warmup')
             warmup_loader = DataLoader(
-                warmup_dataset, 
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers
+                warmup_dataset, batch_size=self.batch_size,
+                shuffle=True, num_workers=self.num_workers,
+                drop_last=True
             )
             return warmup_loader
             
         elif mode == 'train':
+            if len(pred) == 0:
+                return self._create_train_loader()
+                
             labeled_dataset = ProteinDataset(
-                self.train_csv,
-                mode='train',
-                pred=pred,
-                prob=prob
+                self.tokenizer, self.max_seq_len, self.dataset['train'], 
+                mode='train', pred=pred, prob=prob
             )
             unlabeled_dataset = ProteinDataset(
-                self.train_csv,
-                mode='train',
-                pred=~pred,
-                prob=prob
+                self.tokenizer, self.max_seq_len, self.dataset['train'], 
+                mode='train', pred=~pred, prob=prob
             )
             
             labeled_loader = DataLoader(
-                labeled_dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers,
+                labeled_dataset, batch_size=self.batch_size, 
+                shuffle=True, num_workers=self.num_workers,
                 drop_last=True
             )
             
             unlabeled_loader = DataLoader(
-                unlabeled_dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers,
+                unlabeled_dataset, batch_size=self.batch_size,
+                shuffle=True, num_workers=self.num_workers,
                 drop_last=True
             )
             return labeled_loader, unlabeled_loader
             
         elif mode == 'val':
-            val_dataset = ProteinDataset(self.val_csv, mode='val')
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers
+            return DataLoader(
+                self.val_dataset, batch_size=self.batch_size,
+                shuffle=False, num_workers=self.num_workers
             )
-            return val_loader
             
         elif mode == 'test':
-            test_dataset = ProteinDataset(self.test_csv, mode='test')
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers
+            return DataLoader(
+                self.test_dataset, batch_size=self.batch_size,
+                shuffle=False, num_workers=self.num_workers
             )
-            return test_loader
             
         elif mode == 'eval_train':
-            eval_dataset = ProteinDataset(self.train_csv, mode='eval_train')
-            eval_loader = DataLoader(
-                eval_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
+            return DataLoader(
+                ProteinDataset(self.tokenizer, self.max_seq_len, self.dataset['train'], mode='eval_train'),
+                batch_size=self.batch_size, shuffle=False,
                 num_workers=self.num_workers
             )
-            return eval_loader
 
-def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader, unlabeled_trainloader):
+def train(epoch, net, net2, net_type, plm_model, embedding_dict, optimizer, labeled_trainloader, unlabeled_trainloader):
     net.train()
     net2.eval()
     
@@ -185,7 +156,7 @@ def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader,
 
         with torch.no_grad():
             if 'plm' in net_type:
-                embed_u = plm_embedding(plm_model, inputs_u, attention_mask_u)
+                embed_u = get_embedding_from_dict(embedding_dict, inputs_u)
                 embed_u2 = plm_embedding(plm_model, inputs_u2, attention_mask_u)
                 outputs_u11 = net(embed_u, attention_mask_u)
                 outputs_u12 = net(embed_u2, attention_mask_u)
@@ -203,9 +174,8 @@ def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader,
             targets_u = ptu / ptu.sum(dim=1, keepdim=True)
             targets_u = targets_u.detach()       
             
-            
             if 'plm' in net_type:
-                embed_x = plm_embedding(plm_model, inputs_x, attention_mask_x)
+                embed_x = get_embedding_from_dict(embedding_dict, inputs_x)
                 embed_x2 = plm_embedding(plm_model, inputs_x2, attention_mask_x)
                 outputs_x = net(embed_x, attention_mask_x)
                 outputs_x2 = net(embed_x2, attention_mask_x)            
@@ -246,7 +216,7 @@ def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader,
 
         loss = Lx + penalty
         
-        # 梯度累积
+        # gradient accumulation
         loss = loss / args.gradient_accumulation_steps
         loss.backward()
         
@@ -259,14 +229,14 @@ def train(epoch, net, net2, net_type, plm_model, optimizer, labeled_trainloader,
                 %(epoch, args.num_epochs, batch_idx+1, num_iter, Lx.item()))
         sys.stdout.flush()
 
-def warmup(net, net_type, plm_model, optimizer, dataloader):
+def warmup(net, net_type, embedding_dict, optimizer, dataloader):
     net.train()
-    optimizer.zero_grad()  # 移到循环外部
+    optimizer.zero_grad()
     
     for batch_idx, (inputs, attention_mask, labels) in enumerate(dataloader):      
         inputs, attention_mask, labels = inputs.cuda(), attention_mask.cuda(), labels.cuda()
         if 'plm' in net_type:
-            embed = plm_embedding(plm_model, inputs, attention_mask)
+            embed = get_embedding_from_dict(embedding_dict, inputs)
             outputs = net(embed, attention_mask)
         else:
             outputs = net(inputs)
@@ -275,7 +245,7 @@ def warmup(net, net_type, plm_model, optimizer, dataloader):
         penalty = conf_penalty(outputs)
         L = loss + penalty
         
-        # 梯度累积
+        # gradient accumulation
         L = L / args.gradient_accumulation_steps
         L.backward()
         
@@ -288,7 +258,7 @@ def warmup(net, net_type, plm_model, optimizer, dataloader):
                 %(batch_idx+1, len(dataloader), loss.item(), penalty.item()))
         sys.stdout.flush()
 
-def val(net, net_type, plm_model, val_loader):
+def val(net, net_type, embedding_dict, val_loader):
     net.eval()
     correct = 0
     total = 0
@@ -296,7 +266,7 @@ def val(net, net_type, plm_model, val_loader):
         for batch_idx, (inputs, attention_mask, targets) in enumerate(val_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
             if 'plm' in net_type:
-                embed = plm_embedding(plm_model, inputs, attention_mask)
+                embed = get_embedding_from_dict(embedding_dict, inputs)
                 outputs = net(embed, attention_mask)
             else:
                 outputs = net(inputs)
@@ -307,7 +277,7 @@ def val(net, net_type, plm_model, val_loader):
     acc = 100.*correct/total
     return acc
 
-def test(net1, net2, net_type, plm_model, test_loader):
+def test(net1, net2, net_type, embedding_dict, test_loader):
     net1.eval()
     net2.eval()
     correct = 0
@@ -316,7 +286,7 @@ def test(net1, net2, net_type, plm_model, test_loader):
         for batch_idx, (inputs, attention_mask, targets) in enumerate(test_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda()
             if 'plm' in net_type:
-                embed = plm_embedding(plm_model, inputs, attention_mask)
+                embed = get_embedding_from_dict(embedding_dict, inputs)
                 outputs1 = net1(embed, attention_mask)       
                 outputs2 = net2(embed, attention_mask)           
             else:
@@ -332,14 +302,14 @@ def test(net1, net2, net_type, plm_model, test_loader):
     return acc
 
 @torch.no_grad()
-def eval_train(net, net_type, plm_model, eval_loader):
+def eval_train(net, net_type, embedding_dict, eval_loader):
     net.eval()
     losses = torch.zeros(len(eval_loader.dataset))
     with torch.no_grad():
         for batch_idx, (inputs, attention_mask, targets) in enumerate(eval_loader):
             inputs, attention_mask, targets = inputs.cuda(), attention_mask.cuda(), targets.cuda() 
             if 'plm' in net_type:
-                embed = plm_embedding(plm_model, inputs, attention_mask)
+                embed = get_embedding_from_dict(embedding_dict, inputs)
                 outputs = net(embed, attention_mask) 
             else:
                 outputs = net(inputs) 
@@ -368,6 +338,29 @@ def plm_embedding(plm_model, aa_seq, attention_mask):
     gc.collect()
     torch.cuda.empty_cache()
     return seq_embeds
+
+@torch.no_grad()
+def pre_calculate_plm_embedding(plm_model, tokenizer, max_seq_len, dataset):
+    print('Pre-calculating PLM embeddings...')
+    aa_seq = list(dataset['train']['aa_seq']) + list(dataset['validation']['aa_seq']) + list(dataset['test']['aa_seq'])
+    inputs = tokenizer(aa_seq, padding='max_length', max_length=max_seq_len, truncation=True, return_tensors='pt')
+    # get embedding dict, key is each aa_seq input ids, value is each aa_seq embedding
+    batch_size = 96
+    embedding_dict = {}
+    for i in tqdm(range(0, len(inputs['input_ids']), batch_size)):
+        batch_inputs = inputs['input_ids'][i:i+batch_size].cuda()
+        batch_attention_mask = inputs['attention_mask'][i:i+batch_size].cuda()
+        batch_embeds = plm_embedding(plm_model, batch_inputs, batch_attention_mask)
+        for input_ids, embed in zip(batch_inputs, batch_embeds):
+            embedding_dict[str(input_ids.cpu())] = embed.cpu()
+    return embedding_dict
+
+def get_embedding_from_dict(embedding_dict, input_ids):
+    embeds = []
+    for input_id in input_ids:
+        embeds.append(embedding_dict[str(input_id.cpu())])
+    embeds = torch.stack(embeds).cuda()
+    return embeds
 
 class NegEntropy(object):
     def __call__(self,outputs):
@@ -435,7 +428,9 @@ if __name__ == '__main__':
     parser.add_argument('--plm_model', default='facebook/esm2_t33_650M_UR50D', type=str, help='PLM model')
     parser.add_argument('--net_type', default='plm_attn1d', choices=['plm_attn1d', 'plm_conv', 'conv'], type=str, help='net type')
     parser.add_argument('--batch_size', default=4, type=int, help='train batchsize') 
+    parser.add_argument('--max_seq_len', default=1024, type=int, help='max sequence length')
     parser.add_argument('--lr', default=0.0005, type=float, help='initial learning rate')
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation steps')
     parser.add_argument('--alpha', default=0.5, type=float, help='parameter for Beta')
     parser.add_argument('--lambda_u', default=0, type=float, help='weight for unsupervised loss')
     parser.add_argument('--p_threshold', default=0.5, type=float, help='clean probability threshold')
@@ -443,12 +438,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', default=100, type=int, help='total epochs')
     parser.add_argument('--warmup_epochs', default=10, type=int, help='warmup epochs')
     parser.add_argument('--seed', default=42, type=int, help='random seed')
+    
+    # dataset
     parser.add_argument('--num_labels', default=2, type=int, help='number of classes')
-    parser.add_argument('--dataset_dir', default='data/PDBSol', type=str, help='path to dataset')
+    parser.add_argument('--dataset_name', default='your_dataset_name', type=str, help='huggingface dataset name')
+    parser.add_argument('--dataset_dir', default=None, type=str, help='path to dataset')
     parser.add_argument('--test_file', default='ExternalTest.csv', type=str, help='test file')
     parser.add_argument('--id', default='protein')
     parser.add_argument('--output_dir', default='ckpt')
-    parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation steps')
     args = parser.parse_args()
     
     set_seed(args.seed)
@@ -456,6 +453,7 @@ if __name__ == '__main__':
     log = open(f'{args.output_dir}/{args.id}.txt', 'w')
     log.flush()
     
+    tokenizer = EsmTokenizer.from_pretrained(args.plm_model)
     if 'plm' in args.net_type:
         plm_model = EsmModel.from_pretrained(args.plm_model).cuda().eval()
     else:
@@ -495,38 +493,45 @@ if __name__ == '__main__':
     best_acc = [0,0]
     
     # create data loader
+    # train_file = os.path.join(args.dataset_dir, 'train.csv')
+    # val_file = os.path.join(args.dataset_dir, 'valid.csv')
+    # test_file = os.path.join(args.dataset_dir, args.test_file)
+    if args.dataset_dir is not None:
+        dataset = load_dataset(args.dataset_dir)
+    else:
+        dataset = load_dataset(args.dataset_name)
     loader = ProteinDataLoader(
-        train_csv=os.path.join(args.dataset_dir, 'train.csv'),
-        val_csv=os.path.join(args.dataset_dir, 'valid.csv'),
-        test_csv=os.path.join(args.dataset_dir, args.test_file),
+        tokenizer=tokenizer,
+        max_seq_len=args.max_seq_len,
+        dataset=dataset,
         batch_size=args.batch_size
     )
-
-
+    embedding_dict = pre_calculate_plm_embedding(plm_model, tokenizer, args.max_seq_len, dataset)
+    
     for epoch in range(args.num_epochs+1):
         # warmup
         if epoch < args.warmup_epochs:
             train_loader = loader.run('warmup')
             print('Warmup Net1')
-            warmup(net1, args.net_type, plm_model, optimizer1, train_loader)     
+            warmup(net1, args.net_type, embedding_dict, optimizer1, train_loader)     
             train_loader = loader.run('warmup')
             print('\nWarmup Net2')
-            warmup(net2, args.net_type, plm_model, optimizer2, train_loader)                 
+            warmup(net2, args.net_type, embedding_dict, optimizer2, train_loader)                 
         else:       
-            pred1 = (prob1 > args.p_threshold)  
-            pred2 = (prob2 > args.p_threshold)      
-            
+            pred1 = (prob1 > args.p_threshold)
+            pred2 = (prob2 > args.p_threshold)
+            print(pred1)
             print('\nTrain Net1')
             labeled_loader1, unlabeled_loader1 = loader.run('train', pred2, prob2)
-            train(epoch, net1, net2, args.net_type, plm_model, optimizer1, labeled_loader1, unlabeled_loader1)
+            train(epoch, net1, net2, args.net_type, plm_model, embedding_dict, optimizer1, labeled_loader1, unlabeled_loader1)
             
             print('\nTrain Net2')
             labeled_loader2, unlabeled_loader2 = loader.run('train', pred1, prob1)
-            train(epoch, net2, net1, args.net_type, plm_model, optimizer2, labeled_loader2, unlabeled_loader2)
+            train(epoch, net2, net1, args.net_type, plm_model, embedding_dict, optimizer2, labeled_loader2, unlabeled_loader2)
         
         # Validation
         val_loader = loader.run('val')
-        acc1 = val(net1, args.net_type, plm_model, val_loader)
+        acc1 = val(net1, args.net_type, embedding_dict, val_loader)
         print("\n| Validation\t Net1  Acc: %.2f%%" %(acc1))
         # save best model
         if acc1 > best_acc[0]:
@@ -535,7 +540,7 @@ if __name__ == '__main__':
             best_acc[0] = acc1
         
         
-        acc2 = val(net2, args.net_type, plm_model, val_loader)
+        acc2 = val(net2, args.net_type, embedding_dict, val_loader)
         print("\n| Validation\t Net2  Acc: %.2f%%" %(acc2))
         # save best model
         if acc2 > best_acc[1]:
@@ -548,11 +553,11 @@ if __name__ == '__main__':
         
         print('\n==== net 1 evaluate next epoch training data loss ====')
         eval_loader = loader.run('eval_train')
-        prob1 = eval_train(net1, args.net_type, plm_model, eval_loader)
+        prob1 = eval_train(net1, args.net_type, embedding_dict, eval_loader)
         
         print('\n==== net 2 evaluate next epoch training data loss ====')
         eval_loader = loader.run('eval_train')
-        prob2 = eval_train(net2, args.net_type, plm_model, eval_loader)
+        prob2 = eval_train(net2, args.net_type, embedding_dict, eval_loader)
 
         
     # Final test
@@ -562,7 +567,7 @@ if __name__ == '__main__':
 
     net1.load_state_dict(checkpoint1)
     net2.load_state_dict(checkpoint2)
-    acc = test(net1, net2, args.net_type, plm_model, test_loader)
+    acc = test(net1, net2, args.net_type, embedding_dict, test_loader)
     
     log.write('Test %s Acc:%.2f\n'%(args.test_file, acc))
     log.close()
