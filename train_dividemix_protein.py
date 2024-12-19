@@ -4,6 +4,7 @@ import torch
 import os
 import gc
 import argparse
+import datasets
 import numpy as np
 import pandas as pd
 import torch.nn as nn
@@ -16,7 +17,6 @@ from torch.utils.data import Dataset, DataLoader
 from accelerate.utils import set_seed
 from transformers import EsmTokenizer, EsmModel
 from src.models.pooling import Attention1dPoolingHead
-from datasets import load_dataset, Dataset, DatasetDict
 
 
 
@@ -32,7 +32,7 @@ class ProteinDataset(Dataset):
         if mode == 'train' and len(pred) > 0:
             # Filter dataset based on pred
             indices = [i for i, p in enumerate(pred) if p]
-            self.dataset = self.dataset[indices]
+            self.dataset = self.dataset.select(indices)
             self.probability = prob[pred]
             
     def __len__(self):
@@ -41,7 +41,6 @@ class ProteinDataset(Dataset):
     def __getitem__(self, idx):
         sequence = self.dataset[idx]['aa_seq']
         label = self.dataset[idx]['label']
-        
         inputs = self.tokenizer(
             sequence, padding='max_length', max_length=self.max_seq_len,
             truncation=True, return_tensors='pt'
@@ -72,18 +71,17 @@ class ProteinDataLoader:
         
     def run(self, mode, pred=[], prob=[]):
         if mode == 'warmup':
-            warmup_dataset = ProteinDataset(self.tokenizer, self.max_seq_len, self.dataset['train'], mode='warmup')
+            warmup_dataset = ProteinDataset(
+                self.tokenizer, self.max_seq_len, 
+                self.dataset['train'], mode='warmup'
+            )
             warmup_loader = DataLoader(
                 warmup_dataset, batch_size=self.batch_size,
-                shuffle=True, num_workers=self.num_workers,
-                drop_last=True
+                shuffle=True, num_workers=self.num_workers
             )
             return warmup_loader
             
         elif mode == 'train':
-            if len(pred) == 0:
-                return self._create_train_loader()
-                
             labeled_dataset = ProteinDataset(
                 self.tokenizer, self.max_seq_len, self.dataset['train'], 
                 mode='train', pred=pred, prob=prob
@@ -107,14 +105,16 @@ class ProteinDataLoader:
             return labeled_loader, unlabeled_loader
             
         elif mode == 'val':
+            val_dataset = ProteinDataset(self.tokenizer, self.max_seq_len, self.dataset['validation'], mode='val')
             return DataLoader(
-                self.val_dataset, batch_size=self.batch_size,
+                val_dataset, batch_size=self.batch_size,
                 shuffle=False, num_workers=self.num_workers
             )
             
         elif mode == 'test':
+            test_dataset = ProteinDataset(self.tokenizer, self.max_seq_len, self.dataset['test'], mode='test')
             return DataLoader(
-                self.test_dataset, batch_size=self.batch_size,
+                test_dataset, batch_size=self.batch_size,
                 shuffle=False, num_workers=self.num_workers
             )
             
@@ -233,7 +233,7 @@ def warmup(net, net_type, embedding_dict, optimizer, dataloader):
     net.train()
     optimizer.zero_grad()
     
-    for batch_idx, (inputs, attention_mask, labels) in enumerate(dataloader):      
+    for batch_idx, (inputs, attention_mask, labels) in enumerate(dataloader):
         inputs, attention_mask, labels = inputs.cuda(), attention_mask.cuda(), labels.cuda()
         if 'plm' in net_type:
             embed = get_embedding_from_dict(embedding_dict, inputs)
@@ -343,6 +343,7 @@ def plm_embedding(plm_model, aa_seq, attention_mask):
 def pre_calculate_plm_embedding(plm_model, tokenizer, max_seq_len, dataset):
     print('Pre-calculating PLM embeddings...')
     aa_seq = list(dataset['train']['aa_seq']) + list(dataset['validation']['aa_seq']) + list(dataset['test']['aa_seq'])
+    print(f"Total data: {len(aa_seq)}")
     inputs = tokenizer(aa_seq, padding='max_length', max_length=max_seq_len, truncation=True, return_tensors='pt')
     # get embedding dict, key is each aa_seq input ids, value is each aa_seq embedding
     batch_size = 96
@@ -352,13 +353,17 @@ def pre_calculate_plm_embedding(plm_model, tokenizer, max_seq_len, dataset):
         batch_attention_mask = inputs['attention_mask'][i:i+batch_size].cuda()
         batch_embeds = plm_embedding(plm_model, batch_inputs, batch_attention_mask)
         for input_ids, embed in zip(batch_inputs, batch_embeds):
-            embedding_dict[str(input_ids.cpu())] = embed.cpu()
+            # Convert input_ids tensor to string key
+            key = ",".join(map(str, input_ids.cpu().tolist()))
+            embedding_dict[key] = embed.cpu()
+    print(f"Pre-calculated PLM embeddings total data: {len(embedding_dict)}")
     return embedding_dict
 
 def get_embedding_from_dict(embedding_dict, input_ids):
     embeds = []
     for input_id in input_ids:
-        embeds.append(embedding_dict[str(input_id.cpu())])
+        input_id = ",".join(map(str, input_id.cpu().tolist()))
+        embeds.append(embedding_dict[input_id])
     embeds = torch.stack(embeds).cuda()
     return embeds
 
@@ -497,30 +502,63 @@ if __name__ == '__main__':
     # val_file = os.path.join(args.dataset_dir, 'valid.csv')
     # test_file = os.path.join(args.dataset_dir, args.test_file)
     if args.dataset_dir is not None:
-        dataset = load_dataset(args.dataset_dir)
+        dataset = datasets.load_dataset(args.dataset_dir)
     else:
-        dataset = load_dataset(args.dataset_name)
+        dataset = datasets.load_dataset(args.dataset_name)
     loader = ProteinDataLoader(
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
         dataset=dataset,
         batch_size=args.batch_size
     )
-    embedding_dict = pre_calculate_plm_embedding(plm_model, tokenizer, args.max_seq_len, dataset)
+    if 'plm' in args.net_type:
+        if args.dataset_dir is not None:
+            embed_path = os.path.join(args.dataset_dir, f'{args.id}_embedding_dict.pth.tar')
+            if os.path.exists(embed_path):
+                embedding_dict = torch.load(embed_path)
+                total_data = len(dataset['train']) + len(dataset['validation']) + len(dataset['test'])
+                print(f"Train: {len(dataset['train'])}, Validation: {len(dataset['validation'])}, Test: {len(dataset['test'])}")
+                print(f"Total data: {total_data}")
+                print(f"Embedding dict length: {len(embedding_dict)}")
+                
+                log.write(f"Train: {len(dataset['train'])}, Validation: {len(dataset['validation'])}, Test: {len(dataset['test'])}\n")
+                log.write(f"Total data: {total_data}\n")
+                log.write(f"Embedding dict length: {len(embedding_dict)}\n")
+                log.flush()
+                
+                if len(embedding_dict) != total_data:
+                    embedding_dict = pre_calculate_plm_embedding(plm_model, tokenizer, args.max_seq_len, dataset)
+                    torch.save(embedding_dict, embed_path)
+                    print('Dataset updated. Pre-calculated PLM embeddings saved.')
+            else:
+                embedding_dict = pre_calculate_plm_embedding(plm_model, tokenizer, args.max_seq_len, dataset)
+                torch.save(embedding_dict, embed_path)
+                print('Dataset not found. Pre-calculated PLM embeddings saved.')
+        
+        if args.dataset_name is not None and args.dataset_dir is None:
+            embed_path = os.path.join('data', args.dataset_name.replace('/', '_'), f'{args.id}_embedding_dict.pt')
+            if os.path.exists(embed_path):
+                embedding_dict = torch.load(embed_path)
+            else:
+                embedding_dict = pre_calculate_plm_embedding(plm_model, tokenizer, args.max_seq_len, dataset)
+                torch.save(embedding_dict, embed_path)
+                print('Pre-calculated PLM embeddings saved.')
+    else:
+        embedding_dict = None
     
     for epoch in range(args.num_epochs+1):
         # warmup
         if epoch < args.warmup_epochs:
-            train_loader = loader.run('warmup')
+            warmup_loader = loader.run('warmup')
             print('Warmup Net1')
-            warmup(net1, args.net_type, embedding_dict, optimizer1, train_loader)     
-            train_loader = loader.run('warmup')
+            warmup(net1, args.net_type, embedding_dict, optimizer1, warmup_loader)     
+            warmup_loader = loader.run('warmup')
             print('\nWarmup Net2')
-            warmup(net2, args.net_type, embedding_dict, optimizer2, train_loader)                 
+            warmup(net2, args.net_type, embedding_dict, optimizer2, warmup_loader)                 
         else:       
             pred1 = (prob1 > args.p_threshold)
             pred2 = (prob2 > args.p_threshold)
-            print(pred1)
+
             print('\nTrain Net1')
             labeled_loader1, unlabeled_loader1 = loader.run('train', pred2, prob2)
             train(epoch, net1, net2, args.net_type, plm_model, embedding_dict, optimizer1, labeled_loader1, unlabeled_loader1)
