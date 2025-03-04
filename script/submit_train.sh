@@ -10,7 +10,7 @@ for lr in ${lr[@]}; do
 done
 
 
-for i in {114965..115000}
+for i in {114965..114983}
 do
     qdel ${i}.fs
 done
