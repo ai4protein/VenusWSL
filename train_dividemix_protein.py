@@ -16,7 +16,7 @@ from sklearn.mixture import GaussianMixture
 from torch.utils.data import Dataset, DataLoader
 from accelerate.utils import set_seed
 from transformers import EsmTokenizer, EsmModel
-from src.models.pooling import Attention1dPoolingHead
+from src.model.pooling import Attention1dPoolingHead
 
 
 
