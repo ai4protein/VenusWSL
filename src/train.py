@@ -4,20 +4,27 @@ import os
 
 import hydra
 import numpy as np
+from sklearn.mixture import GaussianMixture
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import DictConfig, OmegaConf
 
-from src.data.dataset import DataAugment, ProteinDataset
+from src.data.dataset import DataAugment, ProteinDataset, get_dataloader
 from src.model.VenusWSL import PredictorPLM
+from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
 def train(args: DictConfig):
-    logging_dir = os.path.join(args.logging_dir, f"TRAIN_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+    if args.training.baseline:
+        flag = "BASELINE"
+    else:
+        flag = "TRAIN"
+    logging_dir = os.path.join(args.logging_dir, f"{flag}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
     if DIST_WRAPPER.rank == 0:
         # update logging directory with current time
         if not os.path.isdir(args.logging_dir):
@@ -56,18 +63,31 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
-    dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_dataset,
+    train_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_training_set,
+        max_seq_len=args.data.max_seq_len,
+    )
+    val_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_validation_set,
         max_seq_len=args.data.max_seq_len,
     )
 
-    # to get labeled and unlabeled dataloaders
+    labeled_dataloader = get_dataloader(
+        dataset=train_dataset,
+        batch_size=args.data.batch_size,
+        shuffle=False,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
+    )
+    val_dataloader = get_dataloader(
+        dataset=val_dataset,
+        batch_size=args.data.batch_size,
+        shuffle=False,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
+    )
 
     model_1 = PredictorPLM(
-        plm_embedding_dim=1280,
-        num_labels=2,
-    ).to(device)
-    model_2 = PredictorPLM(
         plm_embedding_dim=1280,
         num_labels=2,
     ).to(device)
@@ -79,23 +99,160 @@ def train(args: DictConfig):
             output_device=DIST_WRAPPER.local_rank,
             static_graph=True,
         )
-        model_2 = DDP(
-            model_2,
-            device_ids=[DIST_WRAPPER.local_rank],
-            output_device=DIST_WRAPPER.local_rank,
-            static_graph=True,
-        )
-
     optimizer_1 = torch.optim.Adam(
         model_1.parameters(),
         lr=args.optimizer.lr,
     )
-    optimizer_2 = torch.optim.Adam(
-        model_2.parameters(),
-        lr=args.optimizer.lr,
-    )
+
+    baseline_loss = nn.CrossEntropyLoss()
+    baseline_penalty = NegEntropy()
+    dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
+    dividemix_penalty = PriorPenalty(num_labels=2)
 
     # to imply the main training loop
+    if args.training.baseline:
+        # initialize progress bar
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.epochs), desc="Training", leave=False, ncols=100)
+            with open(f"{logging_dir}/loss.csv", "w") as f:
+                f.write("epoch,loss,val_acc\n")
+        for epoch in range(args.epochs):
+            train_loss = baseline_train_iteration(
+                model_1,
+                optimizer_1,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader,
+            )
+            val_acc = baseline_val_iteration(
+                model_1,
+                baseline_loss,
+                val_dataloader,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
+                with open(f"{logging_dir}/loss.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss},{val_acc}\n")
+
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
+
+    else:  # imply DivideMix
+        model_2 = PredictorPLM(
+            plm_embedding_dim=1280,
+            num_labels=2,
+        ).to(device)
+        if DIST_WRAPPER.world_size > 1:
+            model_2 = DDP(
+                model_2,
+                device_ids=[DIST_WRAPPER.local_rank],
+                output_device=DIST_WRAPPER.local_rank,
+                static_graph=True,
+            )
+        optimizer_2 = torch.optim.Adam(
+            model_2.parameters(),
+            lr=args.optimizer.lr,
+        )
+        data_augment = DataAugment(noise=True)
+
+        gmm_dataloader = get_dataloader(
+            dataset=train_dataset,
+            batch_size=args.data.batch_size,
+            shuffle=False,  # to make sure the calculated probability is consistent
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+
+        # first warmup
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
+            with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
+                f.write("epoch,loss,loss_2,val_acc,val_acc_2\n")
+        for epoch in range(args.training.warmup_epochs):
+            train_loss_1 = baseline_train_iteration(
+                model_1,
+                optimizer_1,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader,
+            )
+            train_loss_2 = baseline_train_iteration(
+                model_2,
+                optimizer_2,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}')
+                with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss_1},{train_loss_2},,\n")
+
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
+
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
+        for epoch in range(args.training.warmup_epochs, args.epochs):
+            prob_1 = gmm_iteration(
+                model_1,
+                gmm_dataloader,
+                dividemix_eval_loss,
+            )
+            prob_2 = gmm_iteration(
+                model_2,
+                gmm_dataloader,
+                dividemix_eval_loss,
+            )
+            prob_clean_1 = (prob_1 > args.training.p_threshold)
+            prob_clean_2 = (prob_2 > args.training.p_threshold)
+            train_loss_1 = train_iteration(
+                model_1,
+                model_2,
+                optimizer_1,
+                labeled_dataloader,
+                unlabeled_dataloader,
+                prob_2,
+                data_augment,
+                augmented_samples=args.training.augmented_samples,
+                sharpening_temp=args.training.sharpening_temp,
+                alpha=args.training.alpha,
+                num_labels=2,
+            )
+            train_loss_2 = train_iteration(
+                model_2,
+                model_1,
+                optimizer_2,
+                labeled_dataloader,
+                unlabeled_dataloader,
+                prob_1,
+                data_augment,
+                augmented_samples=args.training.augmented_samples,
+                sharpening_temp=args.training.sharpening_temp,
+                alpha=args.training.alpha,
+                num_labels=2,
+            )
+            val_acc_1 = val_iteration(
+                model_1,
+                val_dataloader,
+            )
+            val_acc_2 = val_iteration(
+                model_2,
+                val_dataloader,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}',
+                                 val_acc=f'{val_acc_1:.2f}', val_acc_2=f'{val_acc_2:.2f}')
+                with open(f"{logging_dir}/loss.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss_1},{train_loss_2},{val_acc_1},{val_acc_2}\n")
+
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
 
 
 def train_iteration(
@@ -113,13 +270,14 @@ def train_iteration(
     net_1.train()
     net_2.eval()
 
+    epoch_loss = 0
     optimizer.zero_grad()
     for batch_idx, (labeled_input_dict, unlabeled_input_dict) in enumerate(zip(labeled_dataloader, unlabeled_dataloader)):
         device = net_1.device
         labeled_input_dict = to_device(labeled_dataloader, device)
         unlabeled_input_dict = to_device(unlabeled_dataloader, device)
         batch_size = labeled_input_dict['embedding'].shape[0]
-        w_clean = torch.zeros_like(labeled_input_dict['label'])
+        w_clean = labeled_input_dict['pred']
 
         # make labels and guesses
         with torch.no_grad():
@@ -127,14 +285,14 @@ def train_iteration(
             noisy_embedding = []
             noisy_unlabeled_embedding = []
             for _ in range(augmented_samples):
-                noisy_embedding.append(data_augment(labeled_input_dict['embedding']))
+                noisy_embedding.append(data_augment(labeled_input_dict['embedding'], mu=0.0, std=1.0))
                 noisy_unlabeled_embedding.append(data_augment(unlabeled_input_dict['embedding']))
-            noisy_embedding = torch.stack(noisy_embedding, dim=1)  # (batch_size, n_samples, n_residues, c_res)
-            noisy_unlabeled_embedding = torch.stack(noisy_unlabeled_embedding, dim=1)
+            noisy_embedding = torch.cat(noisy_embedding, dim=0)  # (batch_size * n_samples, n_residues, c_res)
+            noisy_unlabeled_embedding = torch.cat(noisy_unlabeled_embedding, dim=0)
 
             # network prediction and aggregation
             pred = torch.mean(
-                torch.softmax(net_1(noisy_embedding), dim=2),  # (batch_size, n_samples, x)
+                torch.softmax(net_1(noisy_embedding), dim=1),  # (batch_size * n_samples, x)
                 dim=1
             )  # (batch_size, x)
             # label sharpening
@@ -145,8 +303,8 @@ def train_iteration(
             # network guessing and aggregation
             guess = torch.mean(
                 torch.cat(
-                    [torch.softmax(net_1(noisy_unlabeled_embedding), dim=2),
-                     torch.softmax(net_2(noisy_unlabeled_embedding), dim=2)], dim=1
+                    [torch.softmax(net_1(noisy_unlabeled_embedding), dim=1),
+                     torch.softmax(net_2(noisy_unlabeled_embedding), dim=1)], dim=0
                 ), dim=1
             )
             # label sharpening
@@ -156,8 +314,8 @@ def train_iteration(
         l = np.random.beta(alpha, alpha)
         l = max(l, 1-l)
 
-        mixed_embedding = torch.cat([noisy_embedding, noisy_unlabeled_embedding], dim=0).view(batch_size * augmented_samples, -1, -1)
-        mixed_label = torch.cat([label, guess], dim=0).view(batch_size * augmented_samples, -1)
+        mixed_embedding = torch.cat([noisy_embedding, noisy_unlabeled_embedding], dim=0)
+        mixed_label = torch.cat([label, guess], dim=0)
 
         augment_idx = torch.randperm(mixed_embedding.shape[0])
         mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
@@ -182,11 +340,107 @@ def train_iteration(
 
         # get sum loss
         loss = loss_label + loss_guess + penalty
+        epoch_loss += loss.item()
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    return loss.item()
+    return epoch_loss / len(labeled_dataloader)
+
+
+def gmm_iteration(
+    net: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    loss_fn: nn.Module,
+):
+    net.eval()
+    losses = []
+    with torch.no_grad():
+        for batch_idx, input_dict in enumerate(loader):
+            device = net.device
+            input_dict = to_device(input_dict, device)
+
+            pred = net(input_dict['embedding'])
+            loss = loss_fn(pred, input_dict['label'])
+            losses.append(loss.item())
+
+            _, predicted = torch.max(pred, 1)
+
+    losses = torch.cat(losses, dim=0)
+    losses = ((losses - losses.min()) / (losses.max() - losses.min())).view(-1, 1)
+
+    # use GMM to guide next epoch training
+    gmm = GaussianMixture(n_components=2, max_iter=10, reg_covar=5e-4, tol=1e-2)
+    gmm.fit(losses)
+    return gmm.predict_proba(losses)[:, gmm.means_.argmin()]
+
+
+def val_iteration(
+    net: nn.Module,
+    loader: torch.utils.data.DataLoader,
+):
+    net.eval()
+
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch_idx, input_dict in enumerate(loader):
+            device = net.device
+            input_dict = to_device(input_dict, device)
+
+            pred = net(input_dict['embedding'])
+            _, predicted = torch.max(pred, 1)
+
+            total += input_dict['label'].size(0)
+            correct += (predicted == input_dict['label']).sum().item()
+
+    return 100. * correct / total
+
+
+def baseline_train_iteration(
+    net: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: nn.Module,
+    penalty_fn: NegEntropy,
+    dataloader: torch.utils.data.DataLoader,
+):
+    net.train()
+    optimizer.zero_grad()
+
+    epoch_loss = 0
+    for batch_idx, input_dict in enumerate(dataloader):
+        device = net.device
+        input_dict = to_device(input_dict, device)
+
+        pred = net(input_dict['embedding'])
+        loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
+        epoch_loss += loss.item()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    return epoch_loss / len(dataloader)
+
+
+def baseline_val_iteration(
+    net: nn.Module,
+    loss_fn: nn.Module,
+    dataloader: torch.utils.data.Data
+):
+    net.eval()
+
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch_idx, input_dict in enumerate(dataloader):
+            device = net.device
+            input_dict = to_device(input_dict, device)
+
+            pred = net(input_dict['embedding'])
+            _, predicted = torch.max(pred, 1)
+
+            total += input_dict['label'].size(0)
+            correct += (predicted == input_dict['label']).sum().item()
+    return 100. * correct / total
 
 
 def to_device(obj, device):
