@@ -19,6 +19,7 @@ def train_iteration(
     sharpening_temp: float = 20.0,
     alpha: float = 0.75,
     num_labels: int = 2,
+    device: torch.device = torch.device("cuda"),
 ):
     net_1.train()
     net_2.eval()
@@ -38,7 +39,6 @@ def train_iteration(
             if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
                 continue
 
-        device = net_1.device
         labeled_input_dict = to_device(labeled_dataloader, device)
         unlabeled_input_dict = to_device(unlabeled_dataloader, device)
         batch_size = labeled_input_dict['embedding'].shape[0]
@@ -57,7 +57,7 @@ def train_iteration(
 
             # network prediction and aggregation
             pred = torch.mean(
-                torch.softmax(net_1(noisy_embedding), dim=1),  # (batch_size * n_samples, x)
+                torch.softmax(net_1(noisy_embedding, labeled_input_dict['mask']), dim=1),  # (batch_size * n_samples, x)
                 dim=1
             )  # (batch_size, x)
             # label sharpening
@@ -69,8 +69,8 @@ def train_iteration(
             # network guessing and aggregation
             guess = torch.mean(
                 torch.cat(
-                    [torch.softmax(net_1(noisy_unlabeled_embedding), dim=1),
-                     torch.softmax(net_2(noisy_unlabeled_embedding), dim=1)], dim=0
+                    [torch.softmax(net_1(noisy_unlabeled_embedding, unlabeled_input_dict['mask']), dim=1),
+                     torch.softmax(net_2(noisy_unlabeled_embedding, unlabeled_input_dict['mask']), dim=1)], dim=0
                 ), dim=1
             )
             # label sharpening
@@ -84,6 +84,7 @@ def train_iteration(
 
         mixed_embedding = torch.cat([noisy_embedding, noisy_unlabeled_embedding], dim=0)
         mixed_label = torch.cat([label, guess], dim=0)
+        mixed_mask = torch.cat([labeled_input_dict['mask'], unlabeled_input_dict['mask']], dim=0)
 
         augment_idx = torch.randperm(mixed_embedding.shape[0])
         mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
@@ -91,7 +92,7 @@ def train_iteration(
         label, guess = torch.split(mixed_label, [batch_size, batch_size], dim=0)
 
         # forward pass
-        pred = net_1(mixed_embedding)  # (batch_size * n_samples * 2, x)
+        pred = net_1(mixed_embedding, mixed_mask)  # (batch_size * n_samples * 2, x)
         pred_label, pred_guess = torch.split(pred, 2, dim=0)
 
         # calculate loss
@@ -121,15 +122,15 @@ def gmm_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
     loss_fn: nn.Module,
+    device: torch.device = torch.device("cuda"),
 ):
     net.eval()
     losses = []
     with torch.no_grad():
         for batch_idx, input_dict in enumerate(loader):
-            device = net.device
             input_dict = to_device(input_dict, device)
 
-            pred = net(input_dict['embedding'])
+            pred = net(input_dict['embedding'], input_dict['mask'])
             loss = loss_fn(pred, input_dict['label'])
             losses.append(loss.item())
 
@@ -147,16 +148,16 @@ def gmm_iteration(
 def val_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
+    device: torch.device = torch.device("cuda"),
 ):
     net.eval()
 
     correct, total = 0, 0
     with torch.no_grad():
         for batch_idx, input_dict in enumerate(loader):
-            device = net.device
             input_dict = to_device(input_dict, device)
 
-            pred = net(input_dict['embedding'])
+            pred = net(input_dict['embedding'], input_dict['mask'])
             _, predicted = torch.max(pred, 1)
 
             total += input_dict['label'].size(0)
@@ -171,16 +172,16 @@ def baseline_train_iteration(
     loss_fn: nn.Module,
     penalty_fn: NegEntropy,
     dataloader: torch.utils.data.DataLoader,
+    device: torch.device = torch.device("cuda"),
 ):
     net.train()
     optimizer.zero_grad()
 
     epoch_loss = 0
     for batch_idx, input_dict in enumerate(dataloader):
-        device = net.device
         input_dict = to_device(input_dict, device)
 
-        pred = net(input_dict['embedding'])
+        pred = net(input_dict['embedding'], input_dict['mask'])
         loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
         epoch_loss += loss.item()
 

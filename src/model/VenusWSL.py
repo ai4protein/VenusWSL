@@ -26,12 +26,21 @@ class PredictorPLMConv(nn.Module):
 
 
 class PredictorPLM(nn.Module):
-    def __init__(self, plm_embed_dim, num_labels):
+    def __init__(
+        self,
+        plm_embed_dim,
+        attn_dim,
+        num_labels):
         super().__init__()
-        self.classifier = Attention1dPoolingHead(plm_embed_dim, num_labels, 0.5)
+        self.linear = nn.Linear(plm_embed_dim, attn_dim)
+        self.activate = nn.ReLU()
+        self.linear_2 = nn.Linear(attn_dim, attn_dim)
+        self.classifier = Attention1dPoolingHead(attn_dim, num_labels, 0.5)
 
     # x is plm embedding
     def forward(self, x, attention_mask):
+        x = self.activate(self.linear(x))
+        x = self.linear_2(x)
         x = self.classifier(x, attention_mask)
         return x
 

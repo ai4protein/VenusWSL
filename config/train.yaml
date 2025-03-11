@@ -28,3 +28,8 @@ model:
 
 optimizer:
   lr: 0.001
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

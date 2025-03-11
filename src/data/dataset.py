@@ -80,9 +80,9 @@ class ProteinDataset(Dataset):
 
         self.data = pd.read_csv(path_to_dataset)
         if max_seq_len > 0:
-            self.data = self.data[len(self.data['aa_seq']) <= max_seq_len]
+            self.data = self.data[self.data['aa_seq'].apply(lambda x: len(x) < max_seq_len)]
         if min_seq_len > 0:
-            self.data = self.data[len(self.data['aa_seq']) >= min_seq_len]
+            self.data = self.data[self.data['aa_seq'].apply(lambda x: len(x) < max_seq_len)]
 
         # sort by sequence length
         self.data = self.data.sort_values(by='aa_seq', key=lambda x: x.str.len(), ascending=False)
@@ -100,25 +100,29 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         # sequence = self.data[idx]['aa_seq']
-        label = self.data[idx]['label']
+        label = self.data['label'][idx]
 
-        embedding_path = self.data[idx]['embedding_path']
-        with open(embedding_path, 'rb') as f:
-            embedding = pickle.load(f)
+        embedding_path = self.data['embedding_path'][idx]
+        if embedding_path.endswith('.pt'):
+            embedding = torch.load(embedding_path, map_location='cpu')
+        elif embedding_path.endswith('.pkl'):
+            with open(embedding_path, 'rb') as f:
+                embedding = pickle.load(f)
+
         data_object = {
             'label': label,
             'embedding': embedding,
+            'mask': torch.ones(embedding.shape[0]),
         }
-        data_object = self.map_to_tensors(data_object)
-
         if self.pred is not None:
             data_object['pred'] = self.pred[idx]
 
+        data_object = self.map_to_tensors(data_object)
         return data_object
 
     def update(self, pred, w_clean):
         self.pred = pred[w_clean]
-        self.data = self.data[w_clean]
+        self.data = self.data[w_clean.cpu().numpy()]
 
         # reinitialize the dataset
         return self.get_dataloader()

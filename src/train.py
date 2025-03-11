@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import warnings
 
 import hydra
 from tqdm import tqdm
@@ -21,9 +22,10 @@ from src.utils.training_utils import (baseline_train_iteration,
                                       val_iteration)
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-@hydra.main(version_base="1.3", config_path="../configs", config_name="train")
+@hydra.main(version_base="1.3", config_path="../config", config_name="train")
 def train(args: DictConfig):
     if args.training.baseline:
         flag = "BASELINE"
@@ -71,7 +73,7 @@ def train(args: DictConfig):
     labeled_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_training_set,
         max_seq_len=args.data.max_seq_len,
-        batch_size=args.data.batch_size,
+        batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
         shuffle=args.data.shuffle,
         num_workers=args.data.num_workers,
@@ -91,9 +93,15 @@ def train(args: DictConfig):
     val_dataloader = val_dataset.get_dataloader()
 
     model_1 = PredictorPLM(
-        plm_embedding_dim=args.model.embedding_dim,
+        plm_embed_dim=args.model.embedding_dim,
+        attn_dim=args.model.attn_dim,
         num_labels=args.model.label_dim,
     ).to(device)
+
+    if DIST_WRAPPER.rank == 0:
+        logging.info(model_1)
+        logging.info(f"Number of parameters: {sum(p.numel() for p in model_1.parameters())}")
+
     if DIST_WRAPPER.world_size > 1:
         logging.info("Using DDP")
         model_1 = DDP(
@@ -126,10 +134,12 @@ def train(args: DictConfig):
                 baseline_loss,
                 baseline_penalty,
                 labeled_dataloader,
+                device=device,
             )
             val_acc = val_iteration(
                 model_1,
                 val_dataloader,
+                device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
@@ -142,7 +152,8 @@ def train(args: DictConfig):
 
     else:  # imply DivideMix
         model_2 = PredictorPLM(
-            plm_embedding_dim=1280,
+            plm_embed_dim=1280,
+            attn_dim=args.model.attn_dim,
             num_labels=2,
         ).to(device)
         if DIST_WRAPPER.world_size > 1:
@@ -168,7 +179,7 @@ def train(args: DictConfig):
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
             max_seq_len=args.data.max_seq_len,
-            batch_size=args.data.batch_size,
+            batch_size=args.batch_size,
             collate_fn=BatchTensorConverter(),
             shuffle=False,
             num_workers=args.data.num_workers,
@@ -188,6 +199,7 @@ def train(args: DictConfig):
                 baseline_loss,
                 baseline_penalty,
                 labeled_dataloader,
+                device=device,
             )
             train_loss_2 = baseline_train_iteration(
                 model_2,
@@ -195,6 +207,7 @@ def train(args: DictConfig):
                 baseline_loss,
                 baseline_penalty,
                 labeled_dataloader,
+                device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
@@ -213,11 +226,13 @@ def train(args: DictConfig):
                 model_1,
                 gmm_dataloader,
                 dividemix_eval_loss,
+                device=device,
             )
             prob_2 = gmm_iteration(
                 model_2,
                 gmm_dataloader,
                 dividemix_eval_loss,
+                device=device,
             )
             prob_clean_1 = (prob_1 > args.training.p_threshold)
             prob_clean_2 = (prob_2 > args.training.p_threshold)
@@ -241,6 +256,7 @@ def train(args: DictConfig):
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,
+                device=device,
             )
             train_loss_2 = train_iteration(
                 model_2,
@@ -255,14 +271,17 @@ def train(args: DictConfig):
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,
+                device=device,
             )
             val_acc_1 = val_iteration(
                 model_1,
                 val_dataloader,
+                device=device,
             )
             val_acc_2 = val_iteration(
                 model_2,
                 val_dataloader,
+                device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
@@ -274,3 +293,7 @@ def train(args: DictConfig):
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
+
+
+if __name__ == "__main__":
+    train()
