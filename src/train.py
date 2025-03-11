@@ -9,16 +9,18 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import DictConfig, OmegaConf
+import rootutils
 
 from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
 from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 from src.utils.training_utils import (baseline_train_iteration,
-                                      baseline_val_iteration,
                                       gmm_iteration,
                                       train_iteration,
                                       val_iteration)
+
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
@@ -78,7 +80,7 @@ def train(args: DictConfig):
     val_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_validation_set,
         max_seq_len=args.data.max_seq_len,
-        batch_size=args.data.batch_size,
+        batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
         shuffle=False,
         num_workers=args.data.num_workers,
@@ -89,8 +91,8 @@ def train(args: DictConfig):
     val_dataloader = val_dataset.get_dataloader()
 
     model_1 = PredictorPLM(
-        plm_embedding_dim=1280,
-        num_labels=2,
+        plm_embedding_dim=args.model.embedding_dim,
+        num_labels=args.model.label_dim,
     ).to(device)
     if DIST_WRAPPER.world_size > 1:
         logging.info("Using DDP")
@@ -125,9 +127,8 @@ def train(args: DictConfig):
                 baseline_penalty,
                 labeled_dataloader,
             )
-            val_acc = baseline_val_iteration(
+            val_acc = val_iteration(
                 model_1,
-                baseline_loss,
                 val_dataloader,
             )
             if DIST_WRAPPER.rank == 0:
@@ -167,14 +168,13 @@ def train(args: DictConfig):
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
             max_seq_len=args.data.max_seq_len,
-        )
-        gmm_dataloader = gmm_dataset.get_dataloader(
             batch_size=args.data.batch_size,
             collate_fn=BatchTensorConverter(),
             shuffle=False,
             num_workers=args.data.num_workers,
             pin_memory=args.data.pin_memory,
         )
+        gmm_dataloader = gmm_dataset.get_dataloader()
 
         # first warmup
         if DIST_WRAPPER.rank == 0:
@@ -237,6 +237,7 @@ def train(args: DictConfig):
                 prob_2,
                 data_augment,
                 augmented_samples=args.training.augmented_samples,
+                augment_scale=args.training.augment_scale,
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,
@@ -250,6 +251,7 @@ def train(args: DictConfig):
                 prob_1,
                 data_augment,
                 augmented_samples=args.training.augmented_samples,
+                augment_scale=args.training.augment_scale,
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,

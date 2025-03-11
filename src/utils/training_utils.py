@@ -15,6 +15,7 @@ def train_iteration(
     unlabeled_dataloader: torch.utils.data.DataLoader,
     data_augment: DataAugment,
     augmented_samples: int = 2,
+    augment_scale: tuple = (0.0, 1.0),
     sharpening_temp: float = 20.0,
     alpha: float = 0.75,
     num_labels: int = 2,
@@ -22,9 +23,21 @@ def train_iteration(
     net_1.train()
     net_2.eval()
 
+    unlabeled_train_iter = iter(unlabeled_dataloader)
+
     epoch_loss = 0
     optimizer.zero_grad()
-    for batch_idx, (labeled_input_dict, unlabeled_input_dict) in enumerate(zip(labeled_dataloader, unlabeled_dataloader)):
+    for batch_idx, labeled_input_dict in enumerate(labeled_dataloader):
+        try:
+            unlabeled_input_dict = next(unlabeled_train_iter)
+            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
+                continue
+        except:
+            unlabeled_train_iter = iter(unlabeled_dataloader)
+            unlabeled_input_dict = next(unlabeled_train_iter)
+            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
+                continue
+
         device = net_1.device
         labeled_input_dict = to_device(labeled_dataloader, device)
         unlabeled_input_dict = to_device(unlabeled_dataloader, device)
@@ -37,8 +50,8 @@ def train_iteration(
             noisy_embedding = []
             noisy_unlabeled_embedding = []
             for _ in range(augmented_samples):
-                noisy_embedding.append(data_augment(labeled_input_dict['embedding'], mu=0.0, std=1.0))
-                noisy_unlabeled_embedding.append(data_augment(unlabeled_input_dict['embedding']))
+                noisy_embedding.append(data_augment(labeled_input_dict['embedding'], mu=augment_scale[0], std=augment_scale[1]))
+                noisy_unlabeled_embedding.append(data_augment(unlabeled_input_dict['embedding'], mu=augment_scale[0], std=augment_scale[1]))
             noisy_embedding = torch.cat(noisy_embedding, dim=0)  # (batch_size * n_samples, n_residues, c_res)
             noisy_unlabeled_embedding = torch.cat(noisy_unlabeled_embedding, dim=0)
 
@@ -50,6 +63,7 @@ def train_iteration(
             # label sharpening
             label = w_clean * labeled_input_dict['label'] + (1 - w_clean) * pred
             label = label ** (1 / sharpening_temp)
+            label = label / label.sum(dim=1, keepdim=True)
             label = label.detach()
 
             # network guessing and aggregation
@@ -61,6 +75,8 @@ def train_iteration(
             )
             # label sharpening
             guess = guess ** (1 / sharpening_temp)
+            guess = guess / guess.sum(dim=1, keepdim=True)
+            guess = guess.detach()
 
         # mixmatch
         l = np.random.beta(alpha, alpha)
@@ -172,27 +188,6 @@ def baseline_train_iteration(
         loss.backward()
         optimizer.step()
     return epoch_loss / len(dataloader)
-
-
-def baseline_val_iteration(
-    net: nn.Module,
-    loss_fn: nn.Module,
-    dataloader: torch.utils.data.Data
-):
-    net.eval()
-
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch_idx, input_dict in enumerate(dataloader):
-            device = net.device
-            input_dict = to_device(input_dict, device)
-
-            pred = net(input_dict['embedding'])
-            _, predicted = torch.max(pred, 1)
-
-            total += input_dict['label'].size(0)
-            correct += (predicted == input_dict['label']).sum().item()
-    return 100. * correct / total
 
 
 def to_device(obj, device):
