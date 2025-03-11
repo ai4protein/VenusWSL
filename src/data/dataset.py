@@ -1,5 +1,6 @@
+import copy
 import pickle
-from typing import Dict, Optional, List, Sequence
+from typing import Dict, Optional, List, Sequence, Callable
 
 import pandas as pd
 import torch
@@ -69,6 +70,11 @@ class ProteinDataset(Dataset):
         path_to_dataset: str,
         min_seq_len: int = 20,
         max_seq_len: int = 1024,
+        batch_size: int = 32,
+        collate_fn: Optional[Callable] = None,
+        shuffle: bool = False,
+        num_workers: int = 8,
+        pin_memory: bool = True,
     ):
         assert path_to_dataset.endswith('.csv'), 'Dataset must be in CSV format'
 
@@ -80,8 +86,14 @@ class ProteinDataset(Dataset):
 
         # sort by sequence length
         self.data = self.data.sort_values(by='aa_seq', key=lambda x: x.str.len(), ascending=False)
-
         self.pred = None
+
+        # dataloader arguments
+        self.batch_size = batch_size
+        self.collate_fn = collate_fn
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
 
     def __len__(self):
         return len(self.data)
@@ -104,8 +116,26 @@ class ProteinDataset(Dataset):
 
         return data_object
 
-    def get_predicted_label(self, pred):
-        self.pred = pred
+    def update(self, pred, w_clean):
+        self.pred = pred[w_clean]
+        self.data = self.data[w_clean]
+
+        # reinitialize the dataset
+        return self.get_dataloader()
+
+    def get_dataloader(self):
+        dataloader = DataLoader(
+            self,
+            batch_size=self.batch_size,
+            collate_fn=self.collate_fn,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+        return dataloader
+
+    def clone(self):
+        return copy.deepcopy(self)
 
     @staticmethod
     def map_to_tensors(chain_feats):
@@ -115,23 +145,6 @@ class ProteinDataset(Dataset):
             if k in chain_feats:
                 chain_feats[k] = chain_feats[k].type(dtype)
         return chain_feats
-
-
-def get_dataloader(
-    dataset: Dataset,
-    batch_size: int,
-    shuffle: bool = False,
-    num_workers: int = 8,
-    pin_memory: bool = False,
-):
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=BatchTensorConverter(),
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
 
 
 class BatchTensorConverter:

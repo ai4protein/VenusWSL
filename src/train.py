@@ -10,12 +10,12 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import DictConfig, OmegaConf
 
-from src.data.dataset import DataAugment, ProteinDataset, get_dataloader
+from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
 from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 from src.utils.training_utils import (baseline_train_iteration,
-                                      baseline_val_iteration, 
+                                      baseline_val_iteration,
                                       gmm_iteration,
                                       train_iteration,
                                       val_iteration)
@@ -66,29 +66,27 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
-    train_dataset = ProteinDataset(
+    labeled_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_training_set,
         max_seq_len=args.data.max_seq_len,
+        batch_size=args.data.batch_size,
+        collate_fn=BatchTensorConverter(),
+        shuffle=args.data.shuffle,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
     )
     val_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_validation_set,
         max_seq_len=args.data.max_seq_len,
+        batch_size=args.data.batch_size,
+        collate_fn=BatchTensorConverter(),
+        shuffle=False,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
     )
 
-    labeled_dataloader = get_dataloader(
-        dataset=train_dataset,
-        batch_size=args.data.batch_size,
-        shuffle=False,
-        num_workers=args.data.num_workers,
-        pin_memory=args.data.pin_memory,
-    )
-    val_dataloader = get_dataloader(
-        dataset=val_dataset,
-        batch_size=args.data.batch_size,
-        shuffle=False,
-        num_workers=args.data.num_workers,
-        pin_memory=args.data.pin_memory,
-    )
+    labeled_dataloader = labeled_dataset.get_dataloader()
+    val_dataloader = val_dataset.get_dataloader()
 
     model_1 = PredictorPLM(
         plm_embedding_dim=1280,
@@ -159,10 +157,21 @@ def train(args: DictConfig):
         )
         data_augment = DataAugment(noise=True)
 
-        gmm_dataloader = get_dataloader(
-            dataset=train_dataset,
+        unlabeled_dataset = labeled_dataset.clone()
+        unlabeled_dataloader = unlabeled_dataset.get_dataloader()
+        labeled_dataset_2 = labeled_dataset.clone()
+        labeled_dataloader_2 = labeled_dataset_2.get_dataloader()
+        unlabeled_dataset_2 = labeled_dataset.clone()
+        unlabeled_dataloader_2 = unlabeled_dataset_2.get_dataloader()
+
+        gmm_dataset = ProteinDataset(
+            path_to_dataset=args.data.path_to_training_set,
+            max_seq_len=args.data.max_seq_len,
+        )
+        gmm_dataloader = gmm_dataset.get_dataloader(
             batch_size=args.data.batch_size,
-            shuffle=False,  # to make sure the calculated probability is consistent
+            collate_fn=BatchTensorConverter(),
+            shuffle=False,
             num_workers=args.data.num_workers,
             pin_memory=args.data.pin_memory,
         )
@@ -212,6 +221,13 @@ def train(args: DictConfig):
             )
             prob_clean_1 = (prob_1 > args.training.p_threshold)
             prob_clean_2 = (prob_2 > args.training.p_threshold)
+
+            # update labeled and unlabeled dataset (teaching each other)
+            labeled_dataloader_2 = labeled_dataset.update(prob_1, prob_clean_1)
+            unlabeled_dataloader_2 = unlabeled_dataset.update(prob_1, ~prob_clean_1)  # the remaining part
+            labeled_dataloader = labeled_dataset_2.update(prob_2, prob_clean_2)
+            unlabeled_dataloader = unlabeled_dataset_2.update(prob_2, ~prob_clean_2)
+
             train_loss_1 = train_iteration(
                 model_1,
                 model_2,
@@ -229,8 +245,8 @@ def train(args: DictConfig):
                 model_2,
                 model_1,
                 optimizer_2,
-                labeled_dataloader,
-                unlabeled_dataloader,
+                labeled_dataloader_2,
+                unlabeled_dataloader_2,
                 prob_1,
                 data_augment,
                 augmented_samples=args.training.augmented_samples,
