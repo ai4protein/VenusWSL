@@ -127,6 +127,7 @@ def train(args: DictConfig):
             pbar = tqdm(range(args.epochs), desc="Training", leave=False, ncols=100)
             with open(f"{logging_dir}/loss.csv", "w") as f:
                 f.write("epoch,loss,val_acc\n")
+        val_acc_best = 0.
         for epoch in range(args.epochs):
             train_loss = baseline_train_iteration(
                 model_1,
@@ -149,10 +150,13 @@ def train(args: DictConfig):
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
+                if val_acc > val_acc_best:
+                    val_acc_best = val_acc
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
     else:  # imply DivideMix
         model_2 = PredictorPLM(
-            plm_embed_dim=1280,
+            plm_embed_dim=args.model.embedding_dim,
             attn_dim=args.model.attn_dim,
             num_labels=2,
         ).to(device)
@@ -170,11 +174,9 @@ def train(args: DictConfig):
         data_augment = DataAugment(noise=True)
 
         unlabeled_dataset = labeled_dataset.clone()
-        unlabeled_dataloader = unlabeled_dataset.get_dataloader()
+        unlabeled_dataset_2 = labeled_dataset.clone()
         labeled_dataset_2 = labeled_dataset.clone()
         labeled_dataloader_2 = labeled_dataset_2.get_dataloader()
-        unlabeled_dataset_2 = labeled_dataset.clone()
-        unlabeled_dataloader_2 = unlabeled_dataset_2.get_dataloader()
 
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
@@ -206,7 +208,7 @@ def train(args: DictConfig):
                 optimizer_2,
                 baseline_loss,
                 baseline_penalty,
-                labeled_dataloader,
+                labeled_dataloader_2,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
@@ -221,6 +223,8 @@ def train(args: DictConfig):
 
         if DIST_WRAPPER.rank == 0:
             pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
+
+        val_acc_best, val_acc_best_2 = 0., 0.
         for epoch in range(args.training.warmup_epochs, args.epochs):
             prob_1 = gmm_iteration(
                 model_1,
@@ -249,10 +253,9 @@ def train(args: DictConfig):
                 optimizer_1,
                 labeled_dataloader,
                 unlabeled_dataloader,
-                prob_2,
                 data_augment,
                 augmented_samples=args.training.augmented_samples,
-                augment_scale=args.training.augment_scale,
+                augment_scale=(args.training.augment_mu, args.training.augment_std),
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,
@@ -264,10 +267,9 @@ def train(args: DictConfig):
                 optimizer_2,
                 labeled_dataloader_2,
                 unlabeled_dataloader_2,
-                prob_1,
                 data_augment,
                 augmented_samples=args.training.augmented_samples,
-                augment_scale=args.training.augment_scale,
+                augment_scale=(args.training.augment_mu, args.training.augment_std),
                 sharpening_temp=args.training.sharpening_temp,
                 alpha=args.training.alpha,
                 num_labels=2,
@@ -293,6 +295,13 @@ def train(args: DictConfig):
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
+
+                if val_acc_1 > val_acc_best:
+                    val_acc_best = val_acc_1
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best_1.pt"))
+                if val_acc_2 > val_acc_best_2:
+                    val_acc_best_2 = val_acc_2
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", "best_2.pt"))
 
 
 if __name__ == "__main__":

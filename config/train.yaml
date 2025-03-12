@@ -11,6 +11,8 @@ training:
   warmup_epochs: 10
   p_threshold: 0.5
   augmented_samples: 3
+  augment_mu: 0.0
+  augment_std: 1.0
   sharpening_temp: 0.5
   alpha: 0.5
 
@@ -23,7 +25,8 @@ data:
   pin_memory: False
 
 model:
-  embedding_dim: 1280
+  embedding_dim: 64
+  attn_dim: 512
   label_dim: 2
 
 optimizer:

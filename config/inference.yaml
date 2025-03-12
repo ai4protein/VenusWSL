@@ -1,0 +1,20 @@
+batch_size: 1
+logging_dir: './logs'
+seed: 37
+deterministic: False
+
+data:
+  path_to_dataset: './data/train'
+  max_seq_len: 10000
+  num_workers: 8
+  pin_memory: False
+
+model:
+    embedding_dim: 64
+    attn_dim: 512
+    label_dim: 2
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

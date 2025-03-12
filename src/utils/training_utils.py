@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import tqdm
 from sklearn.mixture import GaussianMixture
 
 from src.data.dataset import DataAugment
@@ -28,16 +29,27 @@ def train_iteration(
 
     epoch_loss = 0
     optimizer.zero_grad()
-    for batch_idx, labeled_input_dict in enumerate(labeled_dataloader):
+    for batch_idx, labeled_input_dict in tqdm.tqdm(enumerate(labeled_dataloader), desc="Training Iteration", leave=True):
         try:
             unlabeled_input_dict = next(unlabeled_train_iter)
-            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
-                continue
+            max_token = max(labeled_input_dict['embedding'].shape[0], unlabeled_input_dict['embedding'].shape[0])
+
+            # pad to the same size
+            if labeled_input_dict['embedding'].shape[0] < max_token:
+                labeled_input_dict = pad(labeled_input_dict, max_token)
+            elif unlabeled_input_dict['embedding'].shape[0] < max_token:
+                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
+
         except:
             unlabeled_train_iter = iter(unlabeled_dataloader)
             unlabeled_input_dict = next(unlabeled_train_iter)
-            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
-                continue
+            max_token = max(labeled_input_dict['embedding'].shape[0], unlabeled_input_dict['embedding'].shape[0])
+
+            # pad to the same size
+            if labeled_input_dict['embedding'].shape[0] < max_token:
+                labeled_input_dict = pad(labeled_input_dict, max_token)
+            elif unlabeled_input_dict['embedding'].shape[0] < max_token:
+                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
 
         labeled_input_dict = to_device(labeled_dataloader, device)
         unlabeled_input_dict = to_device(unlabeled_dataloader, device)
@@ -127,17 +139,16 @@ def gmm_iteration(
     net.eval()
     losses = []
     with torch.no_grad():
-        for batch_idx, input_dict in enumerate(loader):
+        for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="GMM Iteration", leave=True):
             input_dict = to_device(input_dict, device)
 
             pred = net(input_dict['embedding'], input_dict['mask'])
             loss = loss_fn(pred, input_dict['label'])
-            losses.append(loss.item())
-
-            _, predicted = torch.max(pred, 1)
+            losses.append(loss)
 
     losses = torch.cat(losses, dim=0)
     losses = ((losses - losses.min()) / (losses.max() - losses.min())).view(-1, 1)
+    losses = losses.cpu().numpy()
 
     # use GMM to guide next epoch training
     gmm = GaussianMixture(n_components=2, max_iter=10, reg_covar=5e-4, tol=1e-2)
@@ -154,7 +165,7 @@ def val_iteration(
 
     correct, total = 0, 0
     with torch.no_grad():
-        for batch_idx, input_dict in enumerate(loader):
+        for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
 
             pred = net(input_dict['embedding'], input_dict['mask'])
@@ -178,7 +189,7 @@ def baseline_train_iteration(
     optimizer.zero_grad()
 
     epoch_loss = 0
-    for batch_idx, input_dict in enumerate(dataloader):
+    for batch_idx, input_dict in tqdm.tqdm(enumerate(dataloader), desc="Baseline Training Iteration", leave=True):
         input_dict = to_device(input_dict, device)
 
         pred = net(input_dict['embedding'], input_dict['mask'])
@@ -189,6 +200,22 @@ def baseline_train_iteration(
         loss.backward()
         optimizer.step()
     return epoch_loss / len(dataloader)
+
+
+def pad(
+    input_feature_dict: dict,
+    max_seq_len: int,
+):
+    for k, v in input_feature_dict.items():
+        if len(v.shape) == 2:
+            input_feature_dict[k] = torch.cat(
+                [v, torch.zeros(v.shape[0], max_seq_len - v.shape[1]).to(v.device)],
+                dim=1)
+        else:
+            input_feature_dict[k] = torch.cat(
+                [v, torch.zeros(v.shape[0], max_seq_len - v.shape[1], v.shape[2]).to(v.device)],
+                dim=1)
+    return input_feature_dict
 
 
 def to_device(obj, device):
