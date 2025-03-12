@@ -1,23 +1,37 @@
 import datetime
 import logging
 import os
+import warnings
 
 import hydra
-import numpy as np
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import DictConfig, OmegaConf
+import rootutils
 
-from src.data.dataset import DataAugment, ProteinDataset
+from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
+from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
+from src.utils.training_utils import (baseline_train_iteration,
+                                      gmm_iteration,
+                                      train_iteration,
+                                      val_iteration)
+
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-@hydra.main(version_base="1.3", config_path="../configs", config_name="train")
+@hydra.main(version_base="1.3", config_path="../config", config_name="train")
 def train(args: DictConfig):
-    logging_dir = os.path.join(args.logging_dir, f"TRAIN_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+    if args.training.baseline:
+        flag = "BASELINE"
+    else:
+        flag = "TRAIN"
+    logging_dir = os.path.join(args.logging_dir, f"{flag}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
     if DIST_WRAPPER.rank == 0:
         # update logging directory with current time
         if not os.path.isdir(args.logging_dir):
@@ -56,21 +70,38 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
-    dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_dataset,
+    labeled_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_training_set,
         max_seq_len=args.data.max_seq_len,
+        batch_size=args.batch_size,
+        collate_fn=BatchTensorConverter(),
+        shuffle=args.data.shuffle,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
+    )
+    val_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_validation_set,
+        max_seq_len=args.data.max_seq_len,
+        batch_size=args.batch_size,
+        collate_fn=BatchTensorConverter(),
+        shuffle=False,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
     )
 
-    # to get labeled and unlabeled dataloaders
+    labeled_dataloader = labeled_dataset.get_dataloader()
+    val_dataloader = val_dataset.get_dataloader()
 
     model_1 = PredictorPLM(
-        plm_embedding_dim=1280,
-        num_labels=2,
+        plm_embed_dim=args.model.embedding_dim,
+        attn_dim=args.model.attn_dim,
+        num_labels=args.model.label_dim,
     ).to(device)
-    model_2 = PredictorPLM(
-        plm_embedding_dim=1280,
-        num_labels=2,
-    ).to(device)
+
+    if DIST_WRAPPER.rank == 0:
+        logging.info(model_1)
+        logging.info(f"Number of parameters: {sum(p.numel() for p in model_1.parameters())}")
+
     if DIST_WRAPPER.world_size > 1:
         logging.info("Using DDP")
         model_1 = DDP(
@@ -79,126 +110,199 @@ def train(args: DictConfig):
             output_device=DIST_WRAPPER.local_rank,
             static_graph=True,
         )
-        model_2 = DDP(
-            model_2,
-            device_ids=[DIST_WRAPPER.local_rank],
-            output_device=DIST_WRAPPER.local_rank,
-            static_graph=True,
-        )
-
     optimizer_1 = torch.optim.Adam(
         model_1.parameters(),
         lr=args.optimizer.lr,
     )
-    optimizer_2 = torch.optim.Adam(
-        model_2.parameters(),
-        lr=args.optimizer.lr,
-    )
+
+    baseline_loss = nn.CrossEntropyLoss()
+    baseline_penalty = NegEntropy()
+    dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
+    dividemix_penalty = PriorPenalty(num_labels=2)
 
     # to imply the main training loop
-
-
-def train_iteration(
-    net_1: nn.Module,
-    net_2: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    labeled_dataloader: torch.utils.data.DataLoader,
-    unlabeled_dataloader: torch.utils.data.DataLoader,
-    data_augment: DataAugment,
-    augmented_samples: int = 2,
-    sharpening_temp: float = 20.0,
-    alpha: float = 0.75,
-    num_labels: int = 2,
-):
-    net_1.train()
-    net_2.eval()
-
-    optimizer.zero_grad()
-    for batch_idx, (labeled_input_dict, unlabeled_input_dict) in enumerate(zip(labeled_dataloader, unlabeled_dataloader)):
-        device = net_1.device
-        labeled_input_dict = to_device(labeled_dataloader, device)
-        unlabeled_input_dict = to_device(unlabeled_dataloader, device)
-        batch_size = labeled_input_dict['embedding'].shape[0]
-        w_clean = torch.zeros_like(labeled_input_dict['label'])
-
-        # make labels and guesses
-        with torch.no_grad():
-            # embedding augmentation
-            noisy_embedding = []
-            noisy_unlabeled_embedding = []
-            for _ in range(augmented_samples):
-                noisy_embedding.append(data_augment(labeled_input_dict['embedding']))
-                noisy_unlabeled_embedding.append(data_augment(unlabeled_input_dict['embedding']))
-            noisy_embedding = torch.stack(noisy_embedding, dim=1)  # (batch_size, n_samples, n_residues, c_res)
-            noisy_unlabeled_embedding = torch.stack(noisy_unlabeled_embedding, dim=1)
-
-            # network prediction and aggregation
-            pred = torch.mean(
-                torch.softmax(net_1(noisy_embedding), dim=2),  # (batch_size, n_samples, x)
-                dim=1
-            )  # (batch_size, x)
-            # label sharpening
-            label = w_clean * labeled_input_dict['label'] + (1 - w_clean) * pred
-            label = label ** (1 / sharpening_temp)
-            label = label.detach()
-
-            # network guessing and aggregation
-            guess = torch.mean(
-                torch.cat(
-                    [torch.softmax(net_1(noisy_unlabeled_embedding), dim=2),
-                     torch.softmax(net_2(noisy_unlabeled_embedding), dim=2)], dim=1
-                ), dim=1
+    if args.training.baseline:
+        # initialize progress bar
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.epochs), desc="Training", leave=False, ncols=100)
+            with open(f"{logging_dir}/loss.csv", "w") as f:
+                f.write("epoch,loss,val_acc\n")
+        val_acc_best = 0.
+        for epoch in range(args.epochs):
+            train_loss = baseline_train_iteration(
+                model_1,
+                optimizer_1,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader,
+                device=device,
             )
-            # label sharpening
-            guess = guess ** (1 / sharpening_temp)
+            val_acc = val_iteration(
+                model_1,
+                val_dataloader,
+                device=device,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
+                with open(f"{logging_dir}/loss.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss},{val_acc}\n")
 
-        # mixmatch
-        l = np.random.beta(alpha, alpha)
-        l = max(l, 1-l)
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
+                if val_acc > val_acc_best:
+                    val_acc_best = val_acc
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
-        mixed_embedding = torch.cat([noisy_embedding, noisy_unlabeled_embedding], dim=0).view(batch_size * augmented_samples, -1, -1)
-        mixed_label = torch.cat([label, guess], dim=0).view(batch_size * augmented_samples, -1)
+    else:  # imply DivideMix
+        model_2 = PredictorPLM(
+            plm_embed_dim=args.model.embedding_dim,
+            attn_dim=args.model.attn_dim,
+            num_labels=2,
+        ).to(device)
+        if DIST_WRAPPER.world_size > 1:
+            model_2 = DDP(
+                model_2,
+                device_ids=[DIST_WRAPPER.local_rank],
+                output_device=DIST_WRAPPER.local_rank,
+                static_graph=True,
+            )
+        optimizer_2 = torch.optim.Adam(
+            model_2.parameters(),
+            lr=args.optimizer.lr,
+        )
+        data_augment = DataAugment(noise=True)
 
-        augment_idx = torch.randperm(mixed_embedding.shape[0])
-        mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
-        mixed_label = l * mixed_label + (1 - l) * mixed_label[augment_idx]
-        label, guess = torch.split(mixed_label, [batch_size, batch_size], dim=0)
+        unlabeled_dataset = labeled_dataset.clone()
+        unlabeled_dataset_2 = labeled_dataset.clone()
+        labeled_dataset_2 = labeled_dataset.clone()
+        labeled_dataloader_2 = labeled_dataset_2.get_dataloader()
 
-        # forward pass
-        pred = net_1(mixed_embedding)  # (batch_size * n_samples * 2, x)
-        pred_label, pred_guess = torch.split(pred, 2, dim=0)
+        gmm_dataset = ProteinDataset(
+            path_to_dataset=args.data.path_to_training_set,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=False,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+        gmm_dataloader = gmm_dataset.get_dataloader()
 
-        # calculate loss
-        loss_label = - 1 * torch.mean(
-            torch.sum(label * torch.log_softmax(pred_label, dim=1), dim=1)  # (batch_size * n_samples)
-        )  # (1)
-        loss_guess = torch.mean((pred_guess - guess) ** 2)
+        # first warmup
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
+            with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
+                f.write("epoch,loss,loss_2,val_acc,val_acc_2\n")
+        for epoch in range(args.training.warmup_epochs):
+            train_loss_1 = baseline_train_iteration(
+                model_1,
+                optimizer_1,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader,
+                device=device,
+            )
+            train_loss_2 = baseline_train_iteration(
+                model_2,
+                optimizer_2,
+                baseline_loss,
+                baseline_penalty,
+                labeled_dataloader_2,
+                device=device,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}')
+                with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss_1},{train_loss_2},,\n")
 
-        # regularization
-        prior = torch.ones(num_labels) / num_labels
-        prior = prior.to(device)
-        pred_mean = torch.softmax(pred, dim=1).mean(0)
-        penalty = torch.sum(prior * torch.log(prior / pred_mean))
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
 
-        # get sum loss
-        loss = loss_label + loss_guess + penalty
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if DIST_WRAPPER.rank == 0:
+            pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
 
-    return loss.item()
+        val_acc_best, val_acc_best_2 = 0., 0.
+        for epoch in range(args.training.warmup_epochs, args.epochs):
+            prob_1 = gmm_iteration(
+                model_1,
+                gmm_dataloader,
+                dividemix_eval_loss,
+                device=device,
+            )
+            prob_2 = gmm_iteration(
+                model_2,
+                gmm_dataloader,
+                dividemix_eval_loss,
+                device=device,
+            )
+            prob_clean_1 = (prob_1 > args.training.p_threshold)
+            prob_clean_2 = (prob_2 > args.training.p_threshold)
+
+            # update labeled and unlabeled dataset (teaching each other)
+            labeled_dataloader_2 = labeled_dataset.update(prob_1, prob_clean_1)
+            unlabeled_dataloader_2 = unlabeled_dataset.update(prob_1, ~prob_clean_1)  # the remaining part
+            labeled_dataloader = labeled_dataset_2.update(prob_2, prob_clean_2)
+            unlabeled_dataloader = unlabeled_dataset_2.update(prob_2, ~prob_clean_2)
+
+            train_loss_1 = train_iteration(
+                model_1,
+                model_2,
+                optimizer_1,
+                labeled_dataloader,
+                unlabeled_dataloader,
+                data_augment,
+                augmented_samples=args.training.augmented_samples,
+                augment_scale=(args.training.augment_mu, args.training.augment_std),
+                sharpening_temp=args.training.sharpening_temp,
+                alpha=args.training.alpha,
+                num_labels=2,
+                device=device,
+            )
+            train_loss_2 = train_iteration(
+                model_2,
+                model_1,
+                optimizer_2,
+                labeled_dataloader_2,
+                unlabeled_dataloader_2,
+                data_augment,
+                augmented_samples=args.training.augmented_samples,
+                augment_scale=(args.training.augment_mu, args.training.augment_std),
+                sharpening_temp=args.training.sharpening_temp,
+                alpha=args.training.alpha,
+                num_labels=2,
+                device=device,
+            )
+            val_acc_1 = val_iteration(
+                model_1,
+                val_dataloader,
+                device=device,
+            )
+            val_acc_2 = val_iteration(
+                model_2,
+                val_dataloader,
+                device=device,
+            )
+            if DIST_WRAPPER.rank == 0:
+                pbar.update(1)
+                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}',
+                                 val_acc=f'{val_acc_1:.2f}', val_acc_2=f'{val_acc_2:.2f}')
+                with open(f"{logging_dir}/loss.csv", "a") as f:
+                    f.write(f"{epoch},{train_loss_1},{train_loss_2},{val_acc_1},{val_acc_2}\n")
+
+                if epoch % args.training.save_interval == 0:
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
+
+                if val_acc_1 > val_acc_best:
+                    val_acc_best = val_acc_1
+                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best_1.pt"))
+                if val_acc_2 > val_acc_best_2:
+                    val_acc_best_2 = val_acc_2
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", "best_2.pt"))
 
 
-def to_device(obj, device):
-    """Move tensor or dict of tensors to device"""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, dict):
-                to_device(v, device)
-            elif isinstance(v, torch.Tensor):
-                obj[k] = obj[k].to(device)
-    elif isinstance(obj, torch.Tensor):
-        obj = obj.to(device)
-    else:
-        raise Exception(f"type {type(obj)} not supported")
-    return obj
+if __name__ == "__main__":
+    train()
