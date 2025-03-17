@@ -129,6 +129,7 @@ def train(args: DictConfig):
                 f.write("epoch,loss,val_acc\n")
         val_acc_best = 0.
         for epoch in range(args.epochs):
+            torch.cuda.empty_cache()
             train_loss = baseline_train_iteration(
                 model_1,
                 optimizer_1,
@@ -195,6 +196,7 @@ def train(args: DictConfig):
             with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
                 f.write("epoch,loss,loss_2,val_acc,val_acc_2\n")
         for epoch in range(args.training.warmup_epochs):
+            torch.cuda.empty_cache()
             train_loss_1 = baseline_train_iteration(
                 model_1,
                 optimizer_1,
@@ -226,13 +228,14 @@ def train(args: DictConfig):
 
         val_acc_best, val_acc_best_2 = 0., 0.
         for epoch in range(args.training.warmup_epochs, args.epochs):
-            prob_1 = gmm_iteration(
+            torch.cuda.empty_cache()
+            prob_1, gmm_loss_1 = gmm_iteration(
                 model_1,
                 gmm_dataloader,
                 dividemix_eval_loss,
                 device=device,
             )
-            prob_2 = gmm_iteration(
+            prob_2, gmm_loss_2 = gmm_iteration(
                 model_2,
                 gmm_dataloader,
                 dividemix_eval_loss,
@@ -295,6 +298,9 @@ def train(args: DictConfig):
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
+
+                    torch.save(gmm_loss_1, os.path.join(logging_dir, "checkpoints", f"gmm_loss_1_{epoch}.pt"))
+                    torch.save(gmm_loss_2, os.path.join(logging_dir, "checkpoints", f"gmm_loss_2_{epoch}.pt"))
 
                 if val_acc_1 > val_acc_best:
                     val_acc_best = val_acc_1

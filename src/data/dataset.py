@@ -122,7 +122,7 @@ class ProteinDataset(Dataset):
 
     def update(self, pred, w_clean):
         self.pred = pred[w_clean]
-        self.data = self.data[w_clean]  # w_clean should be a numpy array
+        self.data = self.data[w_clean].reset_index(drop=True)  # w_clean should be a numpy array
 
         # reinitialize the dataset
         return self.get_dataloader()
