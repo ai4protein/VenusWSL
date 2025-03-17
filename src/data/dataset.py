@@ -86,6 +86,7 @@ class ProteinDataset(Dataset):
 
         # sort by sequence length
         self.data = self.data.sort_values(by='aa_seq', key=lambda x: x.str.len(), ascending=False)
+        self.data_to_iter = self.data.copy()
         self.pred = None
 
         # dataloader arguments
@@ -96,13 +97,13 @@ class ProteinDataset(Dataset):
         self.pin_memory = pin_memory
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data_to_iter)
 
     def __getitem__(self, idx):
         # sequence = self.data[idx]['aa_seq']
-        label = self.data['label'][idx]
+        label = self.data_to_iter['label'][idx]
 
-        embedding_path = self.data['embedding_path'][idx]
+        embedding_path = self.data_to_iter['embedding_path'][idx]
         if embedding_path.endswith('.pt'):
             embedding = torch.load(embedding_path, map_location='cpu')
         elif embedding_path.endswith('.pkl'):
@@ -122,7 +123,8 @@ class ProteinDataset(Dataset):
 
     def update(self, pred, w_clean):
         self.pred = pred[w_clean]
-        self.data = self.data[w_clean].reset_index(drop=True)  # w_clean should be a numpy array
+        self.data_to_iter = self.data[w_clean]  # w_clean should be a numpy array
+        self.data_to_iter = self.data_to_iter.reset_index(drop=True)
 
         # reinitialize the dataset
         return self.get_dataloader()
