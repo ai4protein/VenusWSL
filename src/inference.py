@@ -79,6 +79,8 @@ def inference(args: DictConfig):
     )
 
     logging.info(f"Accuracy: {acc}")
+    with open(f"{logging_dir}/{acc:.2f}.txt", "w") as f:
+        f.write(f"Accuracy: {acc}")
 
 
 if __name__ == "__main__":

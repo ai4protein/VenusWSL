@@ -41,7 +41,12 @@ class PredictorPLM(nn.Module):
     def forward(self, x, attention_mask):
         x = self.activate(self.linear(x))
         x = self.linear_2(x)
-        x = self.classifier(x, attention_mask)
+        if len(x.shape) == 4:
+            b, n_samples, n_residues, attn_dim = x.shape
+            x = x.view(-1, n_residues, attn_dim)  # (batch_size * n_samples, n_residues, attn_dim)
+            x = self.classifier(x, attention_mask).view(b, n_samples, -1)
+        else:
+            x = self.classifier(x, attention_mask)
         return x
 
 
