@@ -292,7 +292,7 @@ def train(args: DictConfig):
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}',
                                  val_acc=f'{val_acc_1:.2f}', val_acc_2=f'{val_acc_2:.2f}')
-                with open(f"{logging_dir}/loss.csv", "a") as f:
+                with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
                     f.write(f"{epoch},{train_loss_1},{train_loss_2},{val_acc_1},{val_acc_2}\n")
 
                 if epoch % args.training.save_interval == 0:
