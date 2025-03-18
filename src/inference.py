@@ -69,11 +69,17 @@ def inference(args: DictConfig):
         attn_dim=args.model.attn_dim,
         num_labels=args.model.label_dim,
     ).to(device)
-
+    model_2 = PredictorPLM(
+        plm_embed_dim=args.model.embedding_dim,
+        attn_dim=args.model.attn_dim,
+        num_labels=args.model.label_dim,
+    ).to(device)
     model.load_state_dict(torch.load(args.ckpt_dir, map_location=device))
+    model_2.load_state_dict(torch.load(args.ckpt_dir.replace('_1.pt', '_2.pt'), map_location=device))
 
     acc = val_iteration(
-        net=model,
+        model,
+        model_2,
         loader=test_dataloader,
         device=device,
     )

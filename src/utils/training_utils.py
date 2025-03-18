@@ -177,18 +177,21 @@ def gmm_iteration(
 
 
 def val_iteration(
-    net: nn.Module,
+    net_1: nn.Module,
+    net_2: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device = torch.device("cuda"),
 ):
-    net.eval()
+    net_1.eval()
+    net_2.eval()
 
     correct, total = 0, 0
     with torch.no_grad():
         for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
 
-            pred = net(input_dict['embedding'], input_dict['mask'])
+            pred = net_1(input_dict['embedding'], input_dict['mask'])
+            pred += net_2(input_dict['embedding'], input_dict['mask'])
             _, predicted = torch.max(pred, 1)
 
             total += input_dict['label'].size(0)
@@ -220,6 +223,27 @@ def baseline_train_iteration(
         loss.backward()
         optimizer.step()
     return epoch_loss / len(dataloader)
+
+
+def baseline_val_iteration(
+    net: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device = torch.device("cuda"),
+):
+    net.eval()
+
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
+            input_dict = to_device(input_dict, device)
+
+            pred = net(input_dict['embedding'], input_dict['mask'])
+            _, predicted = torch.max(pred, 1)
+
+            total += input_dict['label'].size(0)
+            correct += (predicted == input_dict['label']).sum().item()
+
+    return 100. * correct / total
 
 
 def pad(
