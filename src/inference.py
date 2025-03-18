@@ -14,7 +14,7 @@ import rootutils
 from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
-from src.utils.training_utils import val_iteration
+from src.utils.training_utils import val_iteration, baseline_val_iteration
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -69,20 +69,28 @@ def inference(args: DictConfig):
         attn_dim=args.model.attn_dim,
         num_labels=args.model.label_dim,
     ).to(device)
-    model_2 = PredictorPLM(
-        plm_embed_dim=args.model.embedding_dim,
-        attn_dim=args.model.attn_dim,
-        num_labels=args.model.label_dim,
-    ).to(device)
     model.load_state_dict(torch.load(args.ckpt_dir, map_location=device))
-    model_2.load_state_dict(torch.load(args.ckpt_dir.replace('_1.pt', '_2.pt'), map_location=device))
 
-    acc = val_iteration(
-        model,
-        model_2,
-        loader=test_dataloader,
-        device=device,
-    )
+    if args.dual_model:
+        model_2 = PredictorPLM(
+            plm_embed_dim=args.model.embedding_dim,
+            attn_dim=args.model.attn_dim,
+            num_labels=args.model.label_dim,
+        ).to(device)
+        model_2.load_state_dict(torch.load(args.ckpt_dir.replace('_1.pt', '_2.pt'), map_location=device))
+
+        acc = val_iteration(
+            model,
+            model_2,
+            loader=test_dataloader,
+            device=device,
+        )
+    else:
+        acc = baseline_val_iteration(
+            model,
+            loader=test_dataloader,
+            device=device,
+        )
 
     logging.info(f"Accuracy: {acc}")
     with open(f"{logging_dir}/{acc:.2f}.txt", "w") as f:

@@ -1,4 +1,5 @@
 batch_size: 1
+dual_model: False
 logging_dir: './logs'
 seed: 37
 deterministic: False
