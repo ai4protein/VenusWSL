@@ -15,6 +15,7 @@ def train_iteration(
     labeled_dataloader: torch.utils.data.DataLoader,
     unlabeled_dataloader: torch.utils.data.DataLoader,
     data_augment: DataAugment,
+    better_model: int = 0,
     augmented_samples: int = 2,
     augment_scale: tuple = (0.0, 1.0),
     sharpening_temp: float = 20.0,
@@ -82,10 +83,21 @@ def train_iteration(
             w_clean = w_clean.view(-1, 1)  # (batch_size, 1)
 
             # network prediction and aggregation
-            pred = torch.mean(
-                torch.softmax(net_1(noisy_embedding, labeled_mask), dim=2),  # (batch_size, n_samples, x)
-                dim=1
-            )  # (batch_size, x)
+            if better_model == 0:
+                pred = torch.mean(
+                    torch.softmax(net_1(noisy_embedding, labeled_mask), dim=2),  # (batch_size, n_samples, x)
+                    dim=1
+                )  # (batch_size, x)
+            elif better_model == 1:
+                pred = torch.mean(
+                    torch.softmax(net_1(noisy_embedding, labeled_mask), dim=2),  # (batch_size, n_samples, x)
+                    dim=1
+                )
+            else:
+                pred = torch.mean(
+                    torch.softmax(net_2(noisy_embedding, labeled_mask), dim=2),  # (batch_size, n_samples, x)
+                    dim=1
+                )
             # label sharpening
             label = w_clean * label + (1 - w_clean) * pred  # (batch_size, x)
             label = label ** (1 / sharpening_temp)
@@ -93,14 +105,23 @@ def train_iteration(
             label = label.detach()
 
             # network guessing and aggregation
-            guess = torch.mean(
-                torch.cat(
-                    [torch.softmax(net_1(noisy_unlabeled_embedding, unlabeled_mask), dim=2),
-                     torch.softmax(net_2(noisy_unlabeled_embedding, unlabeled_mask), dim=2)], dim=1  # (batch_size, n_samples * 2, x)
-                ), dim=1  # (batch_size, x)
-            )
+            if better_model == 0:
+                guess = torch.mean(
+                    torch.cat(
+                        [torch.softmax(net_1(noisy_unlabeled_embedding, unlabeled_mask), dim=2),
+                         torch.softmax(net_2(noisy_unlabeled_embedding, unlabeled_mask), dim=2)], dim=1  # (batch_size, n_samples * 2, x)
+                    ), dim=1  # (batch_size, x)
+                )
+            elif better_model == 1:
+                guess = torch.mean(
+                    torch.softmax(net_1(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1  # (batch_size, x)
+                )
+            else:
+                guess = torch.mean(
+                    torch.softmax(net_2(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1  # (batch_size, x)
+                )
             # label sharpening
-            guess = guess ** (1 / sharpening_temp)
+            # guess = guess ** (1 / sharpening_temp)
             guess = guess / guess.sum(dim=1, keepdim=True)
             guess = guess.detach()
 
@@ -118,9 +139,9 @@ def train_iteration(
             dim=0
         )  # (batch_size * n_samples * 2, x)
 
-        augment_idx = torch.randperm(mixed_embedding.shape[0])
-        mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
-        mixed_label = l * mixed_label + (1 - l) * mixed_label[augment_idx]
+        # augment_idx = torch.randperm(mixed_embedding.shape[0])
+        # mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
+        # mixed_label = l * mixed_label + (1 - l) * mixed_label[augment_idx]
         label, guess = torch.split(mixed_label, batch_size * augmented_samples, dim=0)
 
         # forward pass

@@ -233,6 +233,7 @@ def train(args: DictConfig):
             pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
 
         val_acc_best = 0.
+        better_model = 0
         for epoch in range(args.training.warmup_epochs, args.epochs):
             torch.cuda.empty_cache()
             prob_1, gmm_loss_1 = gmm_iteration(
@@ -247,8 +248,18 @@ def train(args: DictConfig):
                 dividemix_eval_loss,
                 device=device,
             )
-            prob_clean_1 = (prob_1 > args.training.p_threshold)
-            prob_clean_2 = (prob_2 > args.training.p_threshold)
+
+            # add an extra step: use the better model to split the dataset
+            if torch.mean(gmm_loss_2) < torch.mean(gmm_loss_1):
+                prob_clean_1 = (prob_2 > args.training.p_threshold)
+                prob_clean_2 = (prob_2 > args.training.p_threshold)
+                prob_1 = prob_2
+                better_model = 2
+            else:
+                prob_clean_1 = (prob_1 > args.training.p_threshold)
+                prob_clean_2 = (prob_1 > args.training.p_threshold)
+                prob_2 = prob_1
+                better_model = 1
 
             # update labeled and unlabeled dataset (teaching each other)
             labeled_dataloader_2 = labeled_dataset.update(prob_1, prob_clean_1)
@@ -263,6 +274,7 @@ def train(args: DictConfig):
                 labeled_dataloader,
                 unlabeled_dataloader,
                 data_augment,
+                better_model=better_model,
                 augmented_samples=args.training.augmented_samples,
                 augment_scale=(args.training.augment_mu, args.training.augment_std),
                 sharpening_temp=args.training.sharpening_temp,
@@ -277,6 +289,7 @@ def train(args: DictConfig):
                 labeled_dataloader_2,
                 unlabeled_dataloader_2,
                 data_augment,
+                better_model=int(-1.5 * better_model ** 2 + 3.5 * better_model),
                 augmented_samples=args.training.augmented_samples,
                 augment_scale=(args.training.augment_mu, args.training.augment_std),
                 sharpening_temp=args.training.sharpening_temp,
@@ -292,10 +305,10 @@ def train(args: DictConfig):
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}',
+                pbar.set_postfix(loss=f'{gmm_loss_1:.2f}', loss_2=f'{gmm_loss_2:.2f}',
                                  val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss_1},{train_loss_2},{val_acc}\n")
+                    f.write(f"{epoch},{gmm_loss_1},{gmm_loss_2},{val_acc}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
