@@ -2,9 +2,11 @@ import datetime
 import logging
 import os
 import warnings
+from os import makedirs
 
 import hydra
 from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -38,6 +40,7 @@ def train(args: DictConfig):
             os.makedirs(args.logging_dir)
         os.makedirs(logging_dir)
         os.makedirs(os.path.join(logging_dir, "checkpoints"))  # for saving checkpoints
+        os.makedirs(os.path.join(logging_dir, "gmm_losses"))
 
         # save current configuration in logging directory
         with open(f"{logging_dir}/config.yaml", "w") as f:
@@ -248,9 +251,11 @@ def train(args: DictConfig):
                 dividemix_eval_loss,
                 device=device,
             )
+            mean_gmm_loss_1 = np.mean(gmm_loss_1)
+            mean_gmm_loss_2 = np.mean(gmm_loss_2)
 
             # add an extra step: use the better model to split the dataset
-            if torch.mean(gmm_loss_2) < torch.mean(gmm_loss_1):
+            if mean_gmm_loss_1 > mean_gmm_loss_2:
                 prob_clean_1 = (prob_2 > args.training.p_threshold)
                 prob_clean_2 = (prob_2 > args.training.p_threshold)
                 prob_1 = prob_2
@@ -305,17 +310,17 @@ def train(args: DictConfig):
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{gmm_loss_1:.2f}', loss_2=f'{gmm_loss_2:.2f}',
+                pbar.set_postfix(loss=f'{mean_gmm_loss_1:.2f}', loss_2=f'{mean_gmm_loss_2:.2f}',
                                  val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{gmm_loss_1},{gmm_loss_2},{val_acc}\n")
+                    f.write(f"{epoch},{mean_gmm_loss_1},{mean_gmm_loss_2},{val_acc}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
 
-                    torch.save(gmm_loss_1, os.path.join(logging_dir, "checkpoints", f"gmm_loss_1_{epoch}.pt"))
-                    torch.save(gmm_loss_2, os.path.join(logging_dir, "checkpoints", f"gmm_loss_2_{epoch}.pt"))
+                    np.save(os.path.join(logging_dir, "gmm_losses", f"gmm_loss_1_{epoch}.npy"), gmm_loss_1)
+                    np.save(os.path.join(logging_dir, "gmm_losses", f"gmm_loss_2_{epoch}.npy"), gmm_loss_2)
 
                 if val_acc > val_acc_best:
                     val_acc_best = val_acc

@@ -22,16 +22,16 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 @hydra.main(version_base="1.3", config_path="../config", config_name="inference")
 def inference(args: DictConfig):
-    logging_dir = os.path.join(args.logging_dir, f"INF_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
-    if DIST_WRAPPER.rank == 0:
-        # update logging directory with current time
-        if not os.path.isdir(args.logging_dir):
-            os.makedirs(args.logging_dir)
-        os.makedirs(logging_dir)
-
-        # save current configuration in logging directory
-        with open(f"{logging_dir}/config.yaml", "w") as f:
-            OmegaConf.save(args, f)
+    # logging_dir = os.path.join(args.logging_dir, f"INF_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+    # if DIST_WRAPPER.rank == 0:
+    #     # update logging directory with current time
+    #     if not os.path.isdir(args.logging_dir):
+    #         os.makedirs(args.logging_dir)
+    #     os.makedirs(logging_dir)
+    #
+    #     # save current configuration in logging directory
+    #     with open(f"{logging_dir}/config.yaml", "w") as f:
+    #         OmegaConf.save(args, f)
 
     # check environment
     use_cuda = torch.cuda.device_count() > 0
@@ -93,8 +93,8 @@ def inference(args: DictConfig):
         )
 
     logging.info(f"Accuracy: {acc}")
-    with open(f"{logging_dir}/{acc:.2f}.txt", "w") as f:
-        f.write(f"Accuracy: {acc}")
+    # with open(f"{logging_dir}/{acc:.2f}.txt", "w") as f:
+    #     f.write(f"Accuracy: {acc}")
 
 
 if __name__ == "__main__":
