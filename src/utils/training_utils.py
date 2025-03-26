@@ -139,14 +139,105 @@ def train_iteration(
             dim=0
         )  # (batch_size * n_samples * 2, x)
 
-        # augment_idx = torch.randperm(mixed_embedding.shape[0])
-        # mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
-        # mixed_label = l * mixed_label + (1 - l) * mixed_label[augment_idx]
+        augment_idx = torch.randperm(mixed_embedding.shape[0])
+        mixed_embedding = l * mixed_embedding + (1 - l) * mixed_embedding[augment_idx]
+        mixed_label = l * mixed_label + (1 - l) * mixed_label[augment_idx]
         label, guess = torch.split(mixed_label, batch_size * augmented_samples, dim=0)
 
         # forward pass
         pred = net_1(mixed_embedding, mixed_mask)  # (batch_size * n_samples * 2, x)
         pred_label, pred_guess = torch.split(pred, batch_size * augmented_samples, dim=0)
+
+        # calculate loss
+        loss_label = - 1 * torch.mean(
+            torch.sum(label * torch.log_softmax(pred_label, dim=1), dim=1)  # (batch_size * n_samples)
+        )  # (1)
+        loss_guess = torch.mean((pred_guess - guess) ** 2)
+
+        # regularization
+        prior = torch.ones(num_labels) / num_labels
+        prior = prior.to(device)
+        pred_mean = torch.softmax(pred, dim=1).mean(0)
+        penalty = torch.sum(prior * torch.log(prior / pred_mean))
+
+        # get sum loss
+        loss = loss_label + loss_guess + penalty
+        epoch_loss += loss.item()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return epoch_loss / len(labeled_dataloader)
+
+
+def simple_train_iteration(
+    net: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    labeled_dataloader: torch.utils.data.DataLoader,
+    unlabeled_dataloader: torch.utils.data.DataLoader,
+    num_labels: int = 2,
+    device: torch.device = torch.device("cuda"),
+):
+    net.train()
+
+    unlabeled_train_iter = iter(unlabeled_dataloader)
+
+    epoch_loss = 0
+    optimizer.zero_grad()
+    for batch_idx, labeled_input_dict in tqdm.tqdm(enumerate(labeled_dataloader), desc="Training Iteration", leave=True):
+        try:
+            unlabeled_input_dict = next(unlabeled_train_iter)
+            max_token = max(labeled_input_dict['embedding'].shape[1], unlabeled_input_dict['embedding'].shape[1])
+
+            # pad to the same size
+            if labeled_input_dict['embedding'].shape[1] < max_token:
+                labeled_input_dict = pad(labeled_input_dict, max_token)
+            elif unlabeled_input_dict['embedding'].shape[1] < max_token:
+                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
+
+            # ignore the last batch if it is not full
+            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
+                continue
+
+        except:
+            unlabeled_train_iter = iter(unlabeled_dataloader)
+            unlabeled_input_dict = next(unlabeled_train_iter)
+            max_token = max(labeled_input_dict['embedding'].shape[1], unlabeled_input_dict['embedding'].shape[1])
+
+            # pad to the same size
+            if labeled_input_dict['embedding'].shape[1] < max_token:
+                labeled_input_dict = pad(labeled_input_dict, max_token)
+            elif unlabeled_input_dict['embedding'].shape[1] < max_token:
+                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
+
+            # ignore the last batch if it is not full
+            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
+                continue
+
+        labeled_input_dict = to_device(labeled_input_dict, device)
+        unlabeled_input_dict = to_device(unlabeled_input_dict, device)
+        batch_size = labeled_input_dict['embedding'].shape[0]
+        w_clean = labeled_input_dict['pred']
+
+        # make labels and guesses
+        with torch.no_grad():
+
+            label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
+
+            # network guessing and aggregation
+            guess = torch.softmax(net(unlabeled_input_dict['embedding'], unlabeled_input_dict['mask']), dim=1)
+            guess = guess.detach()
+
+        mixed_embedding = torch.cat(
+            [labeled_input_dict['embedding'], unlabeled_input_dict['embedding']],
+            dim=0
+        )  # (batch_size * 2, n_residues, c_res)
+        mixed_mask = torch.cat([labeled_input_dict['mask'], unlabeled_input_dict['mask']], dim=0)  # (batch_size * 2, n_residues)
+
+        # forward pass
+        pred = net(mixed_embedding, mixed_mask)  # (batch_size * n_samples * 2, x)
+        pred_label, pred_guess = torch.split(pred, batch_size, dim=0)
 
         # calculate loss
         loss_label = - 1 * torch.mean(

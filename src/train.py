@@ -19,9 +19,11 @@ from src.model.VenusWSL import PredictorPLM
 from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 from src.utils.training_utils import (baseline_train_iteration,
+                                      baseline_val_iteration,
                                       gmm_iteration,
                                       train_iteration,
-                                      val_iteration)
+                                      val_iteration,
+                                      simple_train_iteration)
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -159,6 +161,88 @@ def train(args: DictConfig):
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
     else:  # imply DivideMix
+        # unlabeled_dataset = labeled_dataset.clone()
+        # gmm_dataset = ProteinDataset(
+        #     path_to_dataset=args.data.path_to_training_set,
+        #     max_seq_len=args.data.max_seq_len,
+        #     batch_size=args.batch_size,
+        #     collate_fn=BatchTensorConverter(),
+        #     shuffle=False,
+        #     num_workers=args.data.num_workers,
+        #     pin_memory=args.data.pin_memory,
+        # )
+        # gmm_dataloader = gmm_dataset.get_dataloader()
+        # # first warmup
+        # if DIST_WRAPPER.rank == 0:
+        #     pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
+        #     with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
+        #         f.write("epoch,loss,val_acc\n")
+        # for epoch in range(args.training.warmup_epochs):
+        #     torch.cuda.empty_cache()
+        #     train_loss_1 = baseline_train_iteration(
+        #         model_1,
+        #         optimizer_1,
+        #         baseline_loss,
+        #         baseline_penalty,
+        #         labeled_dataloader,
+        #         device=device,
+        #     )
+        #     val_acc = baseline_val_iteration(
+        #         model_1,
+        #         val_dataloader,
+        #         device=device,
+        #     )
+        #     if DIST_WRAPPER.rank == 0:
+        #         pbar.update(1)
+        #         pbar.set_postfix(loss=f'{train_loss_1:.2f}')
+        #         with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
+        #             f.write(f"{epoch},{train_loss_1},{val_acc}\n")
+        #
+        #         if epoch % args.training.save_interval == 0:
+        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
+        #
+        # if DIST_WRAPPER.rank == 0:
+        #     pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
+        #
+        # prob_1, gmm_loss_1 = gmm_iteration(
+        #         model_1,
+        #         gmm_dataloader,
+        #         dividemix_eval_loss,
+        #         device=device,
+        #     )
+        # prob_clean_1 = (prob_1 > args.training.p_threshold)
+        # labeled_dataloader = labeled_dataset.update(prob_1, prob_clean_1)
+        # unlabeled_dataloader = unlabeled_dataset.update(prob_1, ~prob_clean_1)
+        #
+        # val_acc_best = 0.
+        # for epoch in range(args.training.warmup_epochs, args.epochs):
+        #     torch.cuda.empty_cache()
+        #     train_loss = simple_train_iteration(
+        #         model_1,
+        #         optimizer_1,
+        #         labeled_dataloader,
+        #         unlabeled_dataloader,
+        #         num_labels=2,
+        #         device=device,
+        #     )
+        #     val_acc = baseline_val_iteration(
+        #         model_1,
+        #         val_dataloader,
+        #         device=device,
+        #     )
+        #
+        #     if DIST_WRAPPER.rank == 0:
+        #         pbar.update(1)
+        #         pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
+        #         with open(f"{logging_dir}/loss.csv", "a") as f:
+        #             f.write(f"{epoch},{train_loss},{val_acc}\n")
+        #
+        #         if epoch % args.training.save_interval == 0:
+        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
+        #         if val_acc > val_acc_best:
+        #             val_acc_best = val_acc
+        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
+
         model_2 = PredictorPLM(
             plm_embed_dim=args.model.embedding_dim,
             attn_dim=args.model.attn_dim,
@@ -255,16 +339,19 @@ def train(args: DictConfig):
             mean_gmm_loss_2 = np.mean(gmm_loss_2)
 
             # add an extra step: use the better model to split the dataset
-            if mean_gmm_loss_1 > mean_gmm_loss_2:
-                prob_clean_1 = (prob_2 > args.training.p_threshold)
-                prob_clean_2 = (prob_2 > args.training.p_threshold)
-                prob_1 = prob_2
-                better_model = 2
-            else:
-                prob_clean_1 = (prob_1 > args.training.p_threshold)
-                prob_clean_2 = (prob_1 > args.training.p_threshold)
-                prob_2 = prob_1
-                better_model = 1
+            # if mean_gmm_loss_1 > mean_gmm_loss_2:
+            #     prob_clean_1 = (prob_2 > args.training.p_threshold)
+            #     prob_clean_2 = (prob_2 > args.training.p_threshold)
+            #     prob_1 = prob_2
+            #     better_model = 2
+            # else:
+            #     prob_clean_1 = (prob_1 > args.training.p_threshold)
+            #     prob_clean_2 = (prob_1 > args.training.p_threshold)
+            #     prob_2 = prob_1
+            #     better_model = 1
+
+            prob_clean_1 = (prob_1 > args.training.p_threshold)
+            prob_clean_2 = (prob_2 > args.training.p_threshold)
 
             # update labeled and unlabeled dataset (teaching each other)
             labeled_dataloader_2 = labeled_dataset.update(prob_1, prob_clean_1)
