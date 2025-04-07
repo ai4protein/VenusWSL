@@ -173,6 +173,7 @@ def train_iteration(
 
 def simple_train_iteration(
     net: nn.Module,
+    teacher: nn.Module,
     optimizer: torch.optim.Optimizer,
     labeled_dataloader: torch.utils.data.DataLoader,
     unlabeled_dataloader: torch.utils.data.DataLoader,
@@ -218,15 +219,21 @@ def simple_train_iteration(
         labeled_input_dict = to_device(labeled_input_dict, device)
         unlabeled_input_dict = to_device(unlabeled_input_dict, device)
         batch_size = labeled_input_dict['embedding'].shape[0]
-        w_clean = labeled_input_dict['pred']
+        w_clean = labeled_input_dict['pred'].view(-1, 1)
 
         # make labels and guesses
         with torch.no_grad():
-
+            label_pseudo = torch.softmax(teacher(labeled_input_dict['embedding'], labeled_input_dict['mask']), dim=1)
             label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
+            label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
+            label = label ** (1 / 0.5)
+            label = label / label.sum(dim=1, keepdim=True)
+            label = label.detach()
 
             # network guessing and aggregation
-            guess = torch.softmax(net(unlabeled_input_dict['embedding'], unlabeled_input_dict['mask']), dim=1)
+            guess = torch.softmax(teacher(unlabeled_input_dict['embedding'], unlabeled_input_dict['mask']), dim=1)
+            guess = guess ** (1 / 0.5)
+            guess = guess / guess.sum(dim=1, keepdim=True)
             guess = guess.detach()
 
         mixed_embedding = torch.cat(

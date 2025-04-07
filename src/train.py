@@ -75,6 +75,15 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
+    teacher_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_teaching_set,  # use a different dataset for teacher model
+        max_seq_len=args.data.max_seq_len,
+        batch_size=args.batch_size,
+        collate_fn=BatchTensorConverter(),
+        shuffle=args.data.shuffle,
+        num_workers=args.data.num_workers,
+        pin_memory=args.data.pin_memory,
+    )
     labeled_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_training_set,
         max_seq_len=args.data.max_seq_len,
@@ -94,6 +103,7 @@ def train(args: DictConfig):
         pin_memory=args.data.pin_memory,
     )
 
+    teacher_dataloader = teacher_dataset.get_dataloader()
     labeled_dataloader = labeled_dataset.get_dataloader()
     val_dataloader = val_dataset.get_dataloader()
 
@@ -123,7 +133,6 @@ def train(args: DictConfig):
     baseline_loss = nn.CrossEntropyLoss()
     baseline_penalty = NegEntropy()
     dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
-    dividemix_penalty = PriorPenalty(num_labels=2)
 
     # to imply the main training loop
     if args.training.baseline:
@@ -143,16 +152,21 @@ def train(args: DictConfig):
                 labeled_dataloader,
                 device=device,
             )
-            val_acc = val_iteration(
+            val_acc = baseline_val_iteration(
                 model_1,
                 val_dataloader,
+                device=device,
+            )
+            val_acc_teacher = baseline_val_iteration(
+                model_1,
+                teacher_dataloader,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss},{val_acc}\n")
+                    f.write(f"{epoch},{train_loss},{val_acc},{val_acc_teacher}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
@@ -160,93 +174,11 @@ def train(args: DictConfig):
                     val_acc_best = val_acc
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
-    else:  # imply DivideMix
-        # unlabeled_dataset = labeled_dataset.clone()
-        # gmm_dataset = ProteinDataset(
-        #     path_to_dataset=args.data.path_to_training_set,
-        #     max_seq_len=args.data.max_seq_len,
-        #     batch_size=args.batch_size,
-        #     collate_fn=BatchTensorConverter(),
-        #     shuffle=False,
-        #     num_workers=args.data.num_workers,
-        #     pin_memory=args.data.pin_memory,
-        # )
-        # gmm_dataloader = gmm_dataset.get_dataloader()
-        # # first warmup
-        # if DIST_WRAPPER.rank == 0:
-        #     pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
-        #     with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
-        #         f.write("epoch,loss,val_acc\n")
-        # for epoch in range(args.training.warmup_epochs):
-        #     torch.cuda.empty_cache()
-        #     train_loss_1 = baseline_train_iteration(
-        #         model_1,
-        #         optimizer_1,
-        #         baseline_loss,
-        #         baseline_penalty,
-        #         labeled_dataloader,
-        #         device=device,
-        #     )
-        #     val_acc = baseline_val_iteration(
-        #         model_1,
-        #         val_dataloader,
-        #         device=device,
-        #     )
-        #     if DIST_WRAPPER.rank == 0:
-        #         pbar.update(1)
-        #         pbar.set_postfix(loss=f'{train_loss_1:.2f}')
-        #         with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-        #             f.write(f"{epoch},{train_loss_1},{val_acc}\n")
-        #
-        #         if epoch % args.training.save_interval == 0:
-        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
-        #
-        # if DIST_WRAPPER.rank == 0:
-        #     pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
-        #
-        # prob_1, gmm_loss_1 = gmm_iteration(
-        #         model_1,
-        #         gmm_dataloader,
-        #         dividemix_eval_loss,
-        #         device=device,
-        #     )
-        # prob_clean_1 = (prob_1 > args.training.p_threshold)
-        # labeled_dataloader = labeled_dataset.update(prob_1, prob_clean_1)
-        # unlabeled_dataloader = unlabeled_dataset.update(prob_1, ~prob_clean_1)
-        #
-        # val_acc_best = 0.
-        # for epoch in range(args.training.warmup_epochs, args.epochs):
-        #     torch.cuda.empty_cache()
-        #     train_loss = simple_train_iteration(
-        #         model_1,
-        #         optimizer_1,
-        #         labeled_dataloader,
-        #         unlabeled_dataloader,
-        #         num_labels=2,
-        #         device=device,
-        #     )
-        #     val_acc = baseline_val_iteration(
-        #         model_1,
-        #         val_dataloader,
-        #         device=device,
-        #     )
-        #
-        #     if DIST_WRAPPER.rank == 0:
-        #         pbar.update(1)
-        #         pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
-        #         with open(f"{logging_dir}/loss.csv", "a") as f:
-        #             f.write(f"{epoch},{train_loss},{val_acc}\n")
-        #
-        #         if epoch % args.training.save_interval == 0:
-        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
-        #         if val_acc > val_acc_best:
-        #             val_acc_best = val_acc
-        #             torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
-
+    else:  # imply wsl
         model_2 = PredictorPLM(
             plm_embed_dim=args.model.embedding_dim,
             attn_dim=args.model.attn_dim,
-            num_labels=2,
+            num_labels=args.model.label_dim,
         ).to(device)
         if DIST_WRAPPER.world_size > 1:
             model_2 = DDP(
@@ -259,13 +191,8 @@ def train(args: DictConfig):
             model_2.parameters(),
             lr=args.optimizer.lr,
         )
-        data_augment = DataAugment(noise=True)
 
         unlabeled_dataset = labeled_dataset.clone()
-        unlabeled_dataset_2 = labeled_dataset.clone()
-        labeled_dataset_2 = labeled_dataset.clone()
-        labeled_dataloader_2 = labeled_dataset_2.get_dataloader()
-
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
             max_seq_len=args.data.max_seq_len,
@@ -276,12 +203,11 @@ def train(args: DictConfig):
             pin_memory=args.data.pin_memory,
         )
         gmm_dataloader = gmm_dataset.get_dataloader()
-
         # first warmup
         if DIST_WRAPPER.rank == 0:
             pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
             with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
-                f.write("epoch,loss,loss_2,val_acc\n")
+                f.write("epoch,loss,val_acc\n")
         for epoch in range(args.training.warmup_epochs):
             torch.cuda.empty_cache()
             train_loss_1 = baseline_train_iteration(
@@ -289,130 +215,70 @@ def train(args: DictConfig):
                 optimizer_1,
                 baseline_loss,
                 baseline_penalty,
-                labeled_dataloader,
+                teacher_dataloader,
                 device=device,
             )
-            train_loss_2 = baseline_train_iteration(
-                model_2,
-                optimizer_2,
-                baseline_loss,
-                baseline_penalty,
-                labeled_dataloader_2,
-                device=device,
-            )
-            val_acc = val_iteration(
+            val_acc = baseline_val_iteration(
                 model_1,
-                model_2,
-                val_dataloader,
+                teacher_dataloader,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{train_loss_1:.2f}', loss_2=f'{train_loss_2:.2f}')
+                pbar.set_postfix(loss=f'{train_loss_1:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss_1},{train_loss_2},{val_acc}\n")
+                    f.write(f"{epoch},{train_loss_1},{val_acc}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
-                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
 
         if DIST_WRAPPER.rank == 0:
             pbar = tqdm(range(args.epochs - args.training.warmup_epochs), desc="Training", leave=False, ncols=100)
 
+        prob_1, gmm_loss_1 = gmm_iteration(
+                model_1,
+                gmm_dataloader,
+                dividemix_eval_loss,
+                device=device,
+            )
+        prob_clean_1 = (prob_1 > args.training.p_threshold)
+        labeled_dataloader = labeled_dataset.update(prob_1, prob_clean_1)
+        unlabeled_dataloader = unlabeled_dataset.update(prob_1, ~prob_clean_1)
+
         val_acc_best = 0.
-        better_model = 0
         for epoch in range(args.training.warmup_epochs, args.epochs):
             torch.cuda.empty_cache()
-            prob_1, gmm_loss_1 = gmm_iteration(
-                model_1,
-                gmm_dataloader,
-                dividemix_eval_loss,
-                device=device,
-            )
-            prob_2, gmm_loss_2 = gmm_iteration(
-                model_2,
-                gmm_dataloader,
-                dividemix_eval_loss,
-                device=device,
-            )
-            mean_gmm_loss_1 = np.mean(gmm_loss_1)
-            mean_gmm_loss_2 = np.mean(gmm_loss_2)
-
-            # add an extra step: use the better model to split the dataset
-            # if mean_gmm_loss_1 > mean_gmm_loss_2:
-            #     prob_clean_1 = (prob_2 > args.training.p_threshold)
-            #     prob_clean_2 = (prob_2 > args.training.p_threshold)
-            #     prob_1 = prob_2
-            #     better_model = 2
-            # else:
-            #     prob_clean_1 = (prob_1 > args.training.p_threshold)
-            #     prob_clean_2 = (prob_1 > args.training.p_threshold)
-            #     prob_2 = prob_1
-            #     better_model = 1
-
-            prob_clean_1 = (prob_1 > args.training.p_threshold)
-            prob_clean_2 = (prob_2 > args.training.p_threshold)
-
-            # update labeled and unlabeled dataset (teaching each other)
-            labeled_dataloader_2 = labeled_dataset.update(prob_1, prob_clean_1)
-            unlabeled_dataloader_2 = unlabeled_dataset.update(prob_1, ~prob_clean_1)  # the remaining part
-            labeled_dataloader = labeled_dataset_2.update(prob_2, prob_clean_2)
-            unlabeled_dataloader = unlabeled_dataset_2.update(prob_2, ~prob_clean_2)
-
-            train_loss_1 = train_iteration(
-                model_1,
-                model_2,
-                optimizer_1,
-                labeled_dataloader,
-                unlabeled_dataloader,
-                data_augment,
-                better_model=better_model,
-                augmented_samples=args.training.augmented_samples,
-                augment_scale=(args.training.augment_mu, args.training.augment_std),
-                sharpening_temp=args.training.sharpening_temp,
-                alpha=args.training.alpha,
-                num_labels=2,
-                device=device,
-            )
-            train_loss_2 = train_iteration(
+            train_loss = simple_train_iteration(
                 model_2,
                 model_1,
                 optimizer_2,
-                labeled_dataloader_2,
-                unlabeled_dataloader_2,
-                data_augment,
-                better_model=int(-1.5 * better_model ** 2 + 3.5 * better_model),
-                augmented_samples=args.training.augmented_samples,
-                augment_scale=(args.training.augment_mu, args.training.augment_std),
-                sharpening_temp=args.training.sharpening_temp,
-                alpha=args.training.alpha,
+                labeled_dataloader,
+                unlabeled_dataloader,
                 num_labels=2,
                 device=device,
             )
-            val_acc = val_iteration(
-                model_1,
+            val_acc = baseline_val_iteration(
+                model_2,
+                teacher_dataloader,
+                device=device,
+            )
+            val_acc_2 = baseline_val_iteration(
                 model_2,
                 val_dataloader,
                 device=device,
             )
+
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{mean_gmm_loss_1:.2f}', loss_2=f'{mean_gmm_loss_2:.2f}',
-                                 val_acc=f'{val_acc:.2f}')
+                pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{mean_gmm_loss_1},{mean_gmm_loss_2},{val_acc}\n")
+                    f.write(f"{epoch},{train_loss},{val_acc},{val_acc_2}\n")
 
                 if epoch % args.training.save_interval == 0:
-                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
-                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_2_{epoch}.pt"))
-
-                    np.save(os.path.join(logging_dir, "gmm_losses", f"gmm_loss_1_{epoch}.npy"), gmm_loss_1)
-                    np.save(os.path.join(logging_dir, "gmm_losses", f"gmm_loss_2_{epoch}.npy"), gmm_loss_2)
-
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
                 if val_acc > val_acc_best:
                     val_acc_best = val_acc
-                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best_1.pt"))
-                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", "best_2.pt"))
+                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
 
 if __name__ == "__main__":
