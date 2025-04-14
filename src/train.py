@@ -166,7 +166,7 @@ def train(args: DictConfig):
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss},{val_acc},{val_acc_teacher}\n")
+                    f.write(f"{epoch},{train_loss},{val_acc_teacher},{val_acc}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
@@ -220,6 +220,11 @@ def train(args: DictConfig):
             )
             val_acc = baseline_val_iteration(
                 model_1,
+                val_dataloader,
+                device=device,
+            )
+            teacher_acc = baseline_val_iteration(
+                model_1,
                 teacher_dataloader,
                 device=device,
             )
@@ -227,7 +232,7 @@ def train(args: DictConfig):
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss_1:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss_1},{val_acc}\n")
+                    f.write(f"{epoch},{train_loss_1:.6f},{teacher_acc:.6f},{val_acc:.6f}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
@@ -272,7 +277,7 @@ def train(args: DictConfig):
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss},{val_acc},{val_acc_2}\n")
+                    f.write(f"{epoch},{train_loss:.6f},{val_acc:.6f},{val_acc_2:.6f}\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
