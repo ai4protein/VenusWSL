@@ -259,6 +259,7 @@ def train(args: DictConfig):
                 optimizer_2,
                 labeled_dataloader,
                 unlabeled_dataloader,
+                augment_samples=2,
                 num_labels=2,
                 device=device,
             )

@@ -177,6 +177,7 @@ def simple_train_iteration(
     optimizer: torch.optim.Optimizer,
     labeled_dataloader: torch.utils.data.DataLoader,
     unlabeled_dataloader: torch.utils.data.DataLoader,
+    augment_samples: int = 2,
     num_labels: int = 2,
     device: torch.device = torch.device("cuda"),
 ):
@@ -222,29 +223,62 @@ def simple_train_iteration(
         w_clean = labeled_input_dict['pred'].view(-1, 1)
 
         # make labels and guesses
-        with torch.no_grad():
-            label_pseudo = torch.softmax(teacher(labeled_input_dict['embedding'], labeled_input_dict['mask']), dim=1)
+        with (torch.no_grad()):
+            noisy_embedding = [labeled_input_dict['embedding']]
+            noisy_unlabeled_embedding = [unlabeled_input_dict['embedding']]
+            if augment_samples > 0:
+                for _ in range(augment_samples):
+                    noisy_embedding.append(labeled_input_dict['embedding'] +
+                                           torch.randn_like(labeled_input_dict['embedding']) * 0.05)
+                    noisy_unlabeled_embedding.append(unlabeled_input_dict['embedding'] +
+                                                     torch.randn_like(unlabeled_input_dict['embedding']) * 0.05)
+                noisy_embedding = torch.stack(noisy_embedding, dim=1)  # (batch_size, n_samples, n_residues, c_res)
+                noisy_unlabeled_embedding = torch.stack(noisy_unlabeled_embedding, dim=1)
+
+                labeled_mask = torch.stack([labeled_input_dict['mask']] * (augment_samples + 1), dim=1)
+                unlabeled_mask = torch.stack([unlabeled_input_dict['mask']] * (augment_samples + 1), dim=1)
+
+                label_pseudo = torch.mean(
+                    torch.softmax(teacher(noisy_embedding, labeled_mask), dim=2), dim=1
+                )
+                guess = torch.mean(
+                    torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1
+                )
+            else:
+                noisy_embedding = noisy_embedding[0]
+                noisy_unlabeled_embedding = noisy_unlabeled_embedding[0]
+
+                labeled_mask = labeled_input_dict['mask']
+                unlabeled_mask = unlabeled_input_dict['mask']
+
+                label_pseudo = torch.softmax(teacher(noisy_embedding, labeled_mask), dim=1)
+                guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
+
             label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
             label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
             label = label ** (1 / 0.5)
             label = label / label.sum(dim=1, keepdim=True)
             label = label.detach()
 
-            # network guessing and aggregation
-            guess = torch.softmax(teacher(unlabeled_input_dict['embedding'], unlabeled_input_dict['mask']), dim=1)
             guess = guess ** (1 / 0.5)
             guess = guess / guess.sum(dim=1, keepdim=True)
             guess = guess.detach()
 
+            if augment_samples > 0:
+                label = torch.cat([label] * (augment_samples + 1), dim=0)
+                guess = torch.cat([guess] * (augment_samples + 1), dim=0)
+
         mixed_embedding = torch.cat(
-            [labeled_input_dict['embedding'], unlabeled_input_dict['embedding']],
+            [noisy_embedding, noisy_unlabeled_embedding],
             dim=0
-        )  # (batch_size * 2, n_residues, c_res)
-        mixed_mask = torch.cat([labeled_input_dict['mask'], unlabeled_input_dict['mask']], dim=0)  # (batch_size * 2, n_residues)
+        )  # (batch_size * n_samples * 2, n_residues, c_res)
+        mixed_mask = torch.cat([labeled_mask, unlabeled_mask], dim=0)
 
         # forward pass
         pred = net(mixed_embedding, mixed_mask)  # (batch_size * n_samples * 2, x)
         pred_label, pred_guess = torch.split(pred, batch_size, dim=0)
+        pred_label = pred_label.view(-1, num_labels)  # (batch_size * n_samples, x)
+        pred_guess = pred_guess.view(-1, num_labels)  # (batch_size * n_samples, x)
 
         # calculate loss
         loss_label = - 1 * torch.mean(
