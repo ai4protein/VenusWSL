@@ -132,6 +132,7 @@ def train(args: DictConfig):
 
     baseline_loss = nn.CrossEntropyLoss()
     baseline_penalty = NegEntropy()
+    regression_loss = nn.MSELoss()
     dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
 
     # to imply the main training loop
@@ -149,7 +150,9 @@ def train(args: DictConfig):
                 optimizer_1,
                 baseline_loss,
                 baseline_penalty,
+                regression_loss,
                 labeled_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             val_acc = baseline_val_iteration(

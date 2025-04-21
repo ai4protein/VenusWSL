@@ -179,6 +179,7 @@ def simple_train_iteration(
     unlabeled_dataloader: torch.utils.data.DataLoader,
     augment_samples: int = 2,
     num_labels: int = 2,
+    regression: bool = False,
     device: torch.device = torch.device("cuda"),
 ):
     net.train()
@@ -238,12 +239,20 @@ def simple_train_iteration(
                 labeled_mask = torch.stack([labeled_input_dict['mask']] * (augment_samples + 1), dim=1)
                 unlabeled_mask = torch.stack([unlabeled_input_dict['mask']] * (augment_samples + 1), dim=1)
 
-                label_pseudo = torch.mean(
-                    torch.softmax(teacher(noisy_embedding, labeled_mask), dim=2), dim=1
-                )
-                guess = torch.mean(
-                    torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1
-                )
+                if regression:
+                    label_pseudo = torch.mean(
+                        teacher(noisy_embedding, labeled_mask), dim=1
+                    )
+                    guess = torch.mean(
+                        teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1
+                    )
+                else:
+                    label_pseudo = torch.mean(
+                        torch.softmax(teacher(noisy_embedding, labeled_mask), dim=2), dim=1
+                    )
+                    guess = torch.mean(
+                        torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1
+                    )
             else:
                 noisy_embedding = noisy_embedding[0]
                 noisy_unlabeled_embedding = noisy_unlabeled_embedding[0]
@@ -251,17 +260,24 @@ def simple_train_iteration(
                 labeled_mask = labeled_input_dict['mask']
                 unlabeled_mask = unlabeled_input_dict['mask']
 
-                label_pseudo = torch.softmax(teacher(noisy_embedding, labeled_mask), dim=1)
-                guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
+                if regression:
+                    label_pseudo = teacher(noisy_embedding, labeled_mask)
+                    guess = teacher(noisy_unlabeled_embedding, unlabeled_mask)
+                else:
+                    label_pseudo = torch.softmax(teacher(noisy_embedding, labeled_mask), dim=1)
+                    guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
 
-            label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
-            label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
-            label = label ** (1 / 0.5)
-            label = label / label.sum(dim=1, keepdim=True)
+            if regression:
+                label = w_clean * label_pseudo + (1 - w_clean) * label_pseudo  # (batch_size, x)
+            else:
+                label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
+                label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
+                label = label ** (1 / 0.5)
+                label = label / label.sum(dim=1, keepdim=True)
+                guess = guess ** (1 / 0.5)
+                guess = guess / guess.sum(dim=1, keepdim=True)
+
             label = label.detach()
-
-            guess = guess ** (1 / 0.5)
-            guess = guess / guess.sum(dim=1, keepdim=True)
             guess = guess.detach()
 
             if augment_samples > 0:
@@ -281,19 +297,24 @@ def simple_train_iteration(
         pred_guess = pred_guess.view(-1, num_labels)  # (batch_size * n_samples, x)
 
         # calculate loss
-        loss_label = - 1 * torch.mean(
-            torch.sum(label * torch.log_softmax(pred_label, dim=1), dim=1)  # (batch_size * n_samples)
-        )  # (1)
-        loss_guess = torch.mean((pred_guess - guess) ** 2)
+        if regression:
+            loss_label = torch.mean((pred_label - label) ** 2)
+            loss_guess = torch.mean((pred_guess - guess) ** 2)
+            loss = loss_label + loss_guess
+        else:
+            loss_label = - 1 * torch.mean(
+                torch.sum(label * torch.log_softmax(pred_label, dim=1), dim=1)  # (batch_size * n_samples)
+            )  # (1)
+            loss_guess = torch.mean((pred_guess - guess) ** 2)
 
-        # regularization
-        prior = torch.ones(num_labels) / num_labels
-        prior = prior.to(device)
-        pred_mean = torch.softmax(pred, dim=1).mean(0)
-        penalty = torch.sum(prior * torch.log(prior / pred_mean))
+            # regularization
+            prior = torch.ones(num_labels) / num_labels
+            prior = prior.to(device)
+            pred_mean = torch.softmax(pred, dim=1).mean(0)
+            penalty = torch.sum(prior * torch.log(prior / pred_mean))
 
-        # get sum loss
-        loss = loss_label + loss_guess + penalty
+            # get sum loss
+            loss = loss_label + loss_guess + penalty
         epoch_loss += loss.item()
 
         optimizer.zero_grad()
@@ -358,7 +379,9 @@ def baseline_train_iteration(
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.Module,
     penalty_fn: NegEntropy,
+    reg_loss_fn: nn.Module,
     dataloader: torch.utils.data.DataLoader,
+    regression: bool = False,
     device: torch.device = torch.device("cuda"),
 ):
     net.train()
@@ -369,7 +392,11 @@ def baseline_train_iteration(
         input_dict = to_device(input_dict, device)
 
         pred = net(input_dict['embedding'], input_dict['mask'])
-        loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
+
+        if regression:
+            loss = reg_loss_fn(pred, input_dict['label'])
+        else:
+            loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
         epoch_loss += loss.item()
 
         optimizer.zero_grad()
@@ -381,21 +408,29 @@ def baseline_train_iteration(
 def baseline_val_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
+    regression: bool = False,
     device: torch.device = torch.device("cuda"),
 ):
     net.eval()
 
     correct, total = 0, 0
+    error = 0
     with torch.no_grad():
         for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
 
             pred = net(input_dict['embedding'], input_dict['mask'])
-            _, predicted = torch.max(pred, 1)
 
-            total += input_dict['label'].size(0)
-            correct += (predicted == input_dict['label']).sum().item()
+            if regression:
+                error += torch.mean(torch.abs(pred - input_dict['label'])).item()
+                total += input_dict['label'].size(0)
+            else:
+                _, predicted = torch.max(pred, 1)
+                total += input_dict['label'].size(0)
+                correct += (predicted == input_dict['label']).sum().item()
 
+    if regression:
+        return error / total
     return 100. * correct / total
 
 
