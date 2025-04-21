@@ -268,7 +268,7 @@ def simple_train_iteration(
                     guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
 
             if regression:
-                label = w_clean * label_pseudo + (1 - w_clean) * label_pseudo  # (batch_size, x)
+                label = w_clean * label.view(-1, 1) + (1 - w_clean) * label_pseudo  # (batch_size, x)
             else:
                 label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
                 label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
@@ -328,6 +328,7 @@ def gmm_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
     loss_fn: nn.Module,
+    regression_loss_fn: nn.Module = None,
     device: torch.device = torch.device("cuda"),
 ):
     net.eval()
@@ -337,7 +338,10 @@ def gmm_iteration(
             input_dict = to_device(input_dict, device)
 
             pred = net(input_dict['embedding'], input_dict['mask'])
-            loss = loss_fn(pred, input_dict['label'])
+            if regression_loss_fn is not None:
+                loss = regression_loss_fn(pred, input_dict['label'].view(-1, 1))
+            else:
+                loss = loss_fn(pred, input_dict['label'])
             losses.append(loss)
 
     losses = torch.cat(losses, dim=0)
@@ -394,7 +398,7 @@ def baseline_train_iteration(
         pred = net(input_dict['embedding'], input_dict['mask'])
 
         if regression:
-            loss = reg_loss_fn(pred, input_dict['label'])
+            loss = reg_loss_fn(pred, input_dict['label'].view(-1, 1))
         else:
             loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
         epoch_loss += loss.item()
@@ -422,7 +426,7 @@ def baseline_val_iteration(
             pred = net(input_dict['embedding'], input_dict['mask'])
 
             if regression:
-                error += torch.mean(torch.abs(pred - input_dict['label'])).item()
+                error += torch.mean(torch.abs(pred - input_dict['label'].view(-1, 1))).item()
                 total += input_dict['label'].size(0)
             else:
                 _, predicted = torch.max(pred, 1)

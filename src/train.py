@@ -158,11 +158,13 @@ def train(args: DictConfig):
             val_acc = baseline_val_iteration(
                 model_1,
                 val_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             val_acc_teacher = baseline_val_iteration(
                 model_1,
                 teacher_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
@@ -218,17 +220,21 @@ def train(args: DictConfig):
                 optimizer_1,
                 baseline_loss,
                 baseline_penalty,
+                regression_loss,
                 teacher_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             val_acc = baseline_val_iteration(
                 model_1,
                 val_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             teacher_acc = baseline_val_iteration(
                 model_1,
                 teacher_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
@@ -247,6 +253,7 @@ def train(args: DictConfig):
                 model_1,
                 gmm_dataloader,
                 dividemix_eval_loss,
+                regression_loss_fn=regression_loss if args.training.regression else None,
                 device=device,
             )
         prob_clean_1 = (prob_1 > args.training.p_threshold)
@@ -264,16 +271,19 @@ def train(args: DictConfig):
                 unlabeled_dataloader,
                 augment_samples=2,
                 num_labels=2,
+                regression=args.training.regression,
                 device=device,
             )
             val_acc = baseline_val_iteration(
                 model_2,
                 teacher_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
             val_acc_2 = baseline_val_iteration(
                 model_2,
                 val_dataloader,
+                regression=args.training.regression,
                 device=device,
             )
 

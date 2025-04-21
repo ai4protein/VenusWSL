@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 DTYPE_MAPPING = {
-    'label': torch.int64,
+    'label': torch.float32,
     'embedding': torch.float32,
 }
 
