@@ -133,6 +133,7 @@ def train(args: DictConfig):
     baseline_loss = nn.CrossEntropyLoss()
     baseline_penalty = NegEntropy()
     regression_loss = nn.MSELoss()
+    reg_gmm_loss = nn.MSELoss(reduction="none")
     dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
 
     # to imply the main training loop
@@ -253,7 +254,7 @@ def train(args: DictConfig):
                 model_1,
                 gmm_dataloader,
                 dividemix_eval_loss,
-                regression_loss_fn=regression_loss if args.training.regression else None,
+                regression_loss_fn=reg_gmm_loss if args.training.regression else None,
                 device=device,
             )
         prob_clean_1 = (prob_1 > args.training.p_threshold)
@@ -269,8 +270,8 @@ def train(args: DictConfig):
                 optimizer_2,
                 labeled_dataloader,
                 unlabeled_dataloader,
-                augment_samples=2,
-                num_labels=2,
+                augment_samples=args.training.augmented_samples,
+                num_labels=args.model.label_dim,
                 regression=args.training.regression,
                 device=device,
             )

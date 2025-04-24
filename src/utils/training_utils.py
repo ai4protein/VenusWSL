@@ -6,6 +6,7 @@ from sklearn.mixture import GaussianMixture
 
 from src.data.dataset import DataAugment
 from src.model.loss import NegEntropy
+from src.utils.metrics_utils import accuracy, precision, recall, f1_score, auc, mcc
 
 
 def train_iteration(
@@ -268,7 +269,7 @@ def simple_train_iteration(
                     guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
 
             if regression:
-                label = w_clean * label.view(-1, 1) + (1 - w_clean) * label_pseudo  # (batch_size, x)
+                label = w_clean * labeled_input_dict['label'].view(-1, 1) + (1 - w_clean) * label_pseudo  # (batch_size, x)
             else:
                 label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
                 label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
@@ -417,8 +418,7 @@ def baseline_val_iteration(
 ):
     net.eval()
 
-    correct, total = 0, 0
-    error = 0
+    error, total = 0, 0
     with torch.no_grad():
         for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
@@ -430,12 +430,16 @@ def baseline_val_iteration(
                 total += input_dict['label'].size(0)
             else:
                 _, predicted = torch.max(pred, 1)
-                total += input_dict['label'].size(0)
-                correct += (predicted == input_dict['label']).sum().item()
+                acc = accuracy(predicted, input_dict['label'])
+                pre = precision(predicted, input_dict['label'])
+                rec = recall(predicted, input_dict['label'])
+                f1 = f1_score(predicted, input_dict['label'])
+                auc_score = auc(predicted, input_dict['label'])
+                mcc_score = mcc(predicted, input_dict['label'])
 
     if regression:
         return error / total
-    return 100. * correct / total
+    return acc, pre, rec, f1, auc_score, mcc_score
 
 
 def pad(
