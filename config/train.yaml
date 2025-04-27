@@ -6,8 +6,8 @@ seed: 37
 deterministic: False
 
 training:
+  task: "single_label"
   baseline: True
-  regression: True
   save_interval: 10
   warmup_epochs: 10
   p_threshold: 0.5

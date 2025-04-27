@@ -68,6 +68,7 @@ class DataAugment:
 class ProteinDataset(Dataset):
     def __init__(self,
         path_to_dataset: str,
+        num_classes: int = 10,
         min_seq_len: int = 20,
         max_seq_len: int = 1024,
         batch_size: int = 32,
@@ -90,6 +91,7 @@ class ProteinDataset(Dataset):
         self.pred = None
 
         # dataloader arguments
+        self.num_classes = num_classes
         self.batch_size = batch_size
         self.collate_fn = collate_fn
         self.shuffle = shuffle
@@ -102,6 +104,11 @@ class ProteinDataset(Dataset):
     def __getitem__(self, idx):
         # sequence = self.data[idx]['aa_seq']
         label = self.data_to_iter['label'][idx]
+
+        if len(label.split(',')) > 1:
+            label_ = [0.] * self.num_classes
+            for l in label.split(','):
+                label_[int(l)] = 1.
 
         embedding_path = self.data_to_iter['embedding_path'][idx]
         if embedding_path.endswith('.pt'):

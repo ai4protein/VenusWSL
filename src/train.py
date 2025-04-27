@@ -2,11 +2,10 @@ import datetime
 import logging
 import os
 import warnings
-from os import makedirs
 
 import hydra
+import pandas as pd
 from tqdm import tqdm
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -75,8 +74,9 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
-    teacher_dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_teaching_set,  # use a different dataset for teacher model
+    labeled_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_training_set,
+        num_classes=args.model.label_dim,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -84,8 +84,9 @@ def train(args: DictConfig):
         num_workers=args.data.num_workers,
         pin_memory=args.data.pin_memory,
     )
-    labeled_dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_training_set,
+    teacher_dataset = ProteinDataset(
+        path_to_dataset=args.data.path_to_teaching_set,  # use a different dataset for teacher model
+        num_classes=args.model.label_dim,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -95,6 +96,7 @@ def train(args: DictConfig):
     )
     val_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_validation_set,
+        num_classes=args.model.label_dim,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -103,8 +105,8 @@ def train(args: DictConfig):
         pin_memory=args.data.pin_memory,
     )
 
-    teacher_dataloader = teacher_dataset.get_dataloader()
     labeled_dataloader = labeled_dataset.get_dataloader()
+    teacher_dataloader = teacher_dataset.get_dataloader()
     val_dataloader = val_dataset.get_dataloader()
 
     model_1 = PredictorPLM(
@@ -130,11 +132,19 @@ def train(args: DictConfig):
         lr=args.optimizer.lr,
     )
 
-    baseline_loss = nn.CrossEntropyLoss()
-    baseline_penalty = NegEntropy()
-    regression_loss = nn.MSELoss()
-    reg_gmm_loss = nn.MSELoss(reduction="none")
-    dividemix_eval_loss = nn.CrossEntropyLoss(reduction='none')
+    task = args.training.task
+    if task == "binary" or task == "multi_class":
+        baseline_loss = nn.CrossEntropyLoss()
+        gmm_loss = nn.CrossEntropyLoss(reduction="none")
+        metrics = ["auc", "acc", "recall", "precision", "f1", "mcc"]
+    elif task == "regression":
+        baseline_loss = nn.MSELoss()
+        gmm_loss = nn.MSELoss(reduction="none")
+        metrics = ["mse", "spearman"]
+    elif task == "multi_label":
+        baseline_loss = nn.BCEWithLogitsLoss()
+        gmm_loss = nn.BCEWithLogitsLoss(reduction="none")
+        metrics = ["max_f1"]
 
     # to imply the main training loop
     if args.training.baseline:
@@ -142,43 +152,48 @@ def train(args: DictConfig):
         if DIST_WRAPPER.rank == 0:
             pbar = tqdm(range(args.epochs), desc="Training", leave=False, ncols=100)
             with open(f"{logging_dir}/loss.csv", "w") as f:
-                f.write("epoch,loss,val_acc\n")
-        val_acc_best = 0.
+                f.write("epoch,loss,")
+                for met in metrics:
+                    f.write(f"{met}_t,")
+                for met in metrics:
+                    f.write(f"{met},")
+                f.write("\n")
+
         for epoch in range(args.epochs):
             torch.cuda.empty_cache()
             train_loss = baseline_train_iteration(
                 model_1,
                 optimizer_1,
                 baseline_loss,
-                baseline_penalty,
-                regression_loss,
                 labeled_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
-            val_acc = baseline_val_iteration(
+            val_metrics = baseline_val_iteration(
                 model_1,
                 val_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
-            val_acc_teacher = baseline_val_iteration(
+            val_metrics_teacher = baseline_val_iteration(
                 model_1,
                 teacher_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
+                pbar.set_postfix(loss=f'{train_loss:.2f}')
                 with open(f"{logging_dir}/loss.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss},{val_acc_teacher},{val_acc}\n")
+                    f.write(f"{epoch},{train_loss},")
+                    for met in metrics:
+                        f.write(f"{val_metrics_teacher[met]:.6f},")
+                    for met in metrics:
+                        f.write(f"{val_metrics[met]:.6f},")
+                    f.write("\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
-                if val_acc > val_acc_best:
-                    val_acc_best = val_acc
-                    torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
     else:  # imply wsl
         model_2 = PredictorPLM(
@@ -201,6 +216,7 @@ def train(args: DictConfig):
         unlabeled_dataset = labeled_dataset.clone()
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
+            num_classes=args.model.label_dim,
             max_seq_len=args.data.max_seq_len,
             batch_size=args.batch_size,
             collate_fn=BatchTensorConverter(),
@@ -213,26 +229,29 @@ def train(args: DictConfig):
         if DIST_WRAPPER.rank == 0:
             pbar = tqdm(range(args.training.warmup_epochs), desc="Warmup", leave=False, ncols=100)
             with open(f"{logging_dir}/loss_wsl.csv", "w") as f:
-                f.write("epoch,loss,val_acc\n")
+                f.write("epoch,loss,")
+                for met in metrics:
+                    f.write(f"{met}_t,")
+                for met in metrics:
+                    f.write(f"{met},")
+                f.write("\n")
         for epoch in range(args.training.warmup_epochs):
             torch.cuda.empty_cache()
             train_loss_1 = baseline_train_iteration(
                 model_1,
                 optimizer_1,
                 baseline_loss,
-                baseline_penalty,
-                regression_loss,
                 teacher_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
-            val_acc = baseline_val_iteration(
+            val_metrics = baseline_val_iteration(
                 model_1,
                 val_dataloader,
                 regression=args.training.regression,
                 device=device,
             )
-            teacher_acc = baseline_val_iteration(
+            teacher_metrics = baseline_val_iteration(
                 model_1,
                 teacher_dataloader,
                 regression=args.training.regression,
@@ -242,7 +261,12 @@ def train(args: DictConfig):
                 pbar.update(1)
                 pbar.set_postfix(loss=f'{train_loss_1:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss_1:.6f},{teacher_acc:.6f},{val_acc:.6f}\n")
+                    f.write(f"{epoch},{train_loss_1:.6f},")
+                    for met in metrics:
+                        f.write(f"{teacher_metrics[met]:.6f},")
+                    for met in metrics:
+                        f.write(f"{val_metrics[met]:.6f},")
+                    f.write("\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_1.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_1_{epoch}.pt"))
@@ -253,15 +277,14 @@ def train(args: DictConfig):
         prob_1, gmm_loss_1 = gmm_iteration(
                 model_1,
                 gmm_dataloader,
-                dividemix_eval_loss,
-                regression_loss_fn=reg_gmm_loss if args.training.regression else None,
+                gmm_loss,
+                task=task,
                 device=device,
             )
         prob_clean_1 = (prob_1 > args.training.p_threshold)
         labeled_dataloader = labeled_dataset.update(prob_1, prob_clean_1)
         unlabeled_dataloader = unlabeled_dataset.update(prob_1, ~prob_clean_1)
 
-        val_acc_best = 0.
         for epoch in range(args.training.warmup_epochs, args.epochs):
             torch.cuda.empty_cache()
             train_loss = simple_train_iteration(
@@ -275,30 +298,32 @@ def train(args: DictConfig):
                 regression=args.training.regression,
                 device=device,
             )
-            val_acc = baseline_val_iteration(
+            val_metrics = baseline_val_iteration(
                 model_2,
-                teacher_dataloader,
+                val_dataloader,
                 regression=args.training.regression,
                 device=device,
             )
-            val_acc_2 = baseline_val_iteration(
+            teacher_metrics = baseline_val_iteration(
                 model_2,
-                val_dataloader,
+                teacher_dataloader,
                 regression=args.training.regression,
                 device=device,
             )
 
             if DIST_WRAPPER.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix(loss=f'{train_loss:.2f}', val_acc=f'{val_acc:.2f}')
+                pbar.set_postfix(loss=f'{train_loss:.2f}')
                 with open(f"{logging_dir}/loss_wsl.csv", "a") as f:
-                    f.write(f"{epoch},{train_loss:.6f},{val_acc:.6f},{val_acc_2:.6f}\n")
+                    f.write(f"{epoch},{train_loss:.6f},")
+                    for met in metrics:
+                        f.write(f"{teacher_metrics[met]:.6f},")
+                    for met in metrics:
+                        f.write(f"{val_metrics[met]:.6f},")
+                    f.write("\n")
 
                 if epoch % args.training.save_interval == 0:
                     torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", f"model_{epoch}.pt"))
-                if val_acc > val_acc_best:
-                    val_acc_best = val_acc
-                    torch.save(model_2.state_dict(), os.path.join(logging_dir, "checkpoints", "best.pt"))
 
 
 if __name__ == "__main__":

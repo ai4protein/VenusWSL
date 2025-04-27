@@ -4,9 +4,13 @@ import numpy as np
 import tqdm
 from sklearn.mixture import GaussianMixture
 
+from torchmetrics.classification import Accuracy, Recall, Precision, MatthewsCorrCoef, AUROC, F1Scor
+from torchmetrics.classification import BinaryAccuracy, BinaryRecall, BinaryAUROC, BinaryF1Score, BinaryPrecision, BinaryMatthewsCorrCoef, BinaryF1Score
+from torchmetrics.regression import SpearmanCorrCoef, MeanSquaredError
+
 from src.data.dataset import DataAugment
 from src.model.loss import NegEntropy
-from src.utils.metrics_utils import accuracy, precision, recall, f1_score, auc, mcc
+from src.utils.metrics_utils import MultilabelF1Max
 
 
 def train_iteration(
@@ -176,146 +180,78 @@ def simple_train_iteration(
     net: nn.Module,
     teacher: nn.Module,
     optimizer: torch.optim.Optimizer,
+    loss_fn: nn.Module,
     labeled_dataloader: torch.utils.data.DataLoader,
     unlabeled_dataloader: torch.utils.data.DataLoader,
-    augment_samples: int = 2,
     num_labels: int = 2,
-    regression: bool = False,
+    task: str = "binary",  # options: "binary", "multi_class", "multi_label", "regression"
     device: torch.device = torch.device("cuda"),
 ):
     net.train()
-
     unlabeled_train_iter = iter(unlabeled_dataloader)
-
     epoch_loss = 0
     optimizer.zero_grad()
+
     for batch_idx, labeled_input_dict in tqdm.tqdm(enumerate(labeled_dataloader), desc="Training Iteration", leave=True):
         try:
             unlabeled_input_dict = next(unlabeled_train_iter)
+
             max_token = max(labeled_input_dict['embedding'].shape[1], unlabeled_input_dict['embedding'].shape[1])
 
-            # pad to the same size
+            # pad to same length
             if labeled_input_dict['embedding'].shape[1] < max_token:
                 labeled_input_dict = pad(labeled_input_dict, max_token)
             elif unlabeled_input_dict['embedding'].shape[1] < max_token:
                 unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
 
-            # ignore the last batch if it is not full
             if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
                 continue
 
-        except:
+        except StopIteration:
             unlabeled_train_iter = iter(unlabeled_dataloader)
-            unlabeled_input_dict = next(unlabeled_train_iter)
-            max_token = max(labeled_input_dict['embedding'].shape[1], unlabeled_input_dict['embedding'].shape[1])
-
-            # pad to the same size
-            if labeled_input_dict['embedding'].shape[1] < max_token:
-                labeled_input_dict = pad(labeled_input_dict, max_token)
-            elif unlabeled_input_dict['embedding'].shape[1] < max_token:
-                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
-
-            # ignore the last batch if it is not full
-            if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
-                continue
+            continue
 
         labeled_input_dict = to_device(labeled_input_dict, device)
         unlabeled_input_dict = to_device(unlabeled_input_dict, device)
         batch_size = labeled_input_dict['embedding'].shape[0]
         w_clean = labeled_input_dict['pred'].view(-1, 1)
 
-        # make labels and guesses
-        with (torch.no_grad()):
-            noisy_embedding = [labeled_input_dict['embedding']]
-            noisy_unlabeled_embedding = [unlabeled_input_dict['embedding']]
-            if augment_samples > 0:
-                for _ in range(augment_samples):
-                    noisy_embedding.append(labeled_input_dict['embedding'] +
-                                           torch.randn_like(labeled_input_dict['embedding']) * 0.05)
-                    noisy_unlabeled_embedding.append(unlabeled_input_dict['embedding'] +
-                                                     torch.randn_like(unlabeled_input_dict['embedding']) * 0.05)
-                noisy_embedding = torch.stack(noisy_embedding, dim=1)  # (batch_size, n_samples, n_residues, c_res)
-                noisy_unlabeled_embedding = torch.stack(noisy_unlabeled_embedding, dim=1)
+        # prepare embeddings and masks
+        embedding_labeled = labeled_input_dict['embedding']
+        embedding_unlabeled = unlabeled_input_dict['embedding']
+        mask_labeled = labeled_input_dict['mask']
+        mask_unlabeled = unlabeled_input_dict['mask']
+        label = labeled_input_dict['label']
 
-                labeled_mask = torch.stack([labeled_input_dict['mask']] * (augment_samples + 1), dim=1)
-                unlabeled_mask = torch.stack([unlabeled_input_dict['mask']] * (augment_samples + 1), dim=1)
-
-                if regression:
-                    label_pseudo = torch.mean(
-                        teacher(noisy_embedding, labeled_mask), dim=1
-                    )
-                    guess = torch.mean(
-                        teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1
-                    )
-                else:
-                    label_pseudo = torch.mean(
-                        torch.softmax(teacher(noisy_embedding, labeled_mask), dim=2), dim=1
-                    )
-                    guess = torch.mean(
-                        torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=2), dim=1
-                    )
+        # pseudo label generation
+        with torch.no_grad():
+            if task == "regression":
+                label_pseudo = teacher(embedding_labeled, mask_labeled)
+                label = w_clean * label.view(-1, 1) + (1 - w_clean) * label_pseudo
+                guess = teacher(embedding_unlabeled, mask_unlabeled)
             else:
-                noisy_embedding = noisy_embedding[0]
-                noisy_unlabeled_embedding = noisy_unlabeled_embedding[0]
+                output_labeled = teacher(embedding_labeled, mask_labeled)
+                output_unlabeled = teacher(embedding_unlabeled, mask_unlabeled)
+                if task == "binary" or task == "multi_class":
+                    label_pseudo = torch.softmax(output_labeled, dim=1)
+                    label = torch.nn.functional.one_hot(label, num_classes=num_labels).float()
+                    label = w_clean * label + (1 - w_clean) * label_pseudo
+                    label = label ** (1 / 0.5)
+                    label = label / label.sum(dim=1, keepdim=True)
+                    guess = torch.softmax(output_unlabeled, dim=1)
+                elif task == "multi_label":
+                    label_pseudo = torch.sigmoid(output_labeled)
+                    label = w_clean * label + (1 - w_clean) * label_pseudo
+                    label = label ** (1 / 0.5)
+                    label = label / label.sum(dim=1, keepdim=True)
+                    guess = torch.sigmoid(output_unlabeled)
 
-                labeled_mask = labeled_input_dict['mask']
-                unlabeled_mask = unlabeled_input_dict['mask']
+        label = label.detach()
+        guess = guess.detach()
 
-                if regression:
-                    label_pseudo = teacher(noisy_embedding, labeled_mask)
-                    guess = teacher(noisy_unlabeled_embedding, unlabeled_mask)
-                else:
-                    label_pseudo = torch.softmax(teacher(noisy_embedding, labeled_mask), dim=1)
-                    guess = torch.softmax(teacher(noisy_unlabeled_embedding, unlabeled_mask), dim=1)
-
-            if regression:
-                label = w_clean * labeled_input_dict['label'].view(-1, 1) + (1 - w_clean) * label_pseudo  # (batch_size, x)
-            else:
-                label = torch.nn.functional.one_hot(labeled_input_dict['label'], num_classes=num_labels).float()  # (batch_size, x)
-                label = w_clean * label + (1 - w_clean) * label_pseudo  # (batch_size, x)
-                label = label ** (1 / 0.5)
-                label = label / label.sum(dim=1, keepdim=True)
-                guess = guess ** (1 / 0.5)
-                guess = guess / guess.sum(dim=1, keepdim=True)
-
-            label = label.detach()
-            guess = guess.detach()
-
-            if augment_samples > 0:
-                label = torch.cat([label] * (augment_samples + 1), dim=0)
-                guess = torch.cat([guess] * (augment_samples + 1), dim=0)
-
-        mixed_embedding = torch.cat(
-            [noisy_embedding, noisy_unlabeled_embedding],
-            dim=0
-        )  # (batch_size * n_samples * 2, n_residues, c_res)
-        mixed_mask = torch.cat([labeled_mask, unlabeled_mask], dim=0)
-
-        # forward pass
-        pred = net(mixed_embedding, mixed_mask)  # (batch_size * n_samples * 2, x)
-        pred_label, pred_guess = torch.split(pred, batch_size, dim=0)
-        pred_label = pred_label.view(-1, num_labels)  # (batch_size * n_samples, x)
-        pred_guess = pred_guess.view(-1, num_labels)  # (batch_size * n_samples, x)
-
-        # calculate loss
-        if regression:
-            loss_label = torch.mean((pred_label - label) ** 2)
-            loss_guess = torch.mean((pred_guess - guess) ** 2)
-            loss = loss_label + loss_guess
-        else:
-            loss_label = - 1 * torch.mean(
-                torch.sum(label * torch.log_softmax(pred_label, dim=1), dim=1)  # (batch_size * n_samples)
-            )  # (1)
-            loss_guess = torch.mean((pred_guess - guess) ** 2)
-
-            # regularization
-            prior = torch.ones(num_labels) / num_labels
-            prior = prior.to(device)
-            pred_mean = torch.softmax(pred, dim=1).mean(0)
-            penalty = torch.sum(prior * torch.log(prior / pred_mean))
-
-            # get sum loss
-            loss = loss_label + loss_guess + penalty
+        labeled_pred = net(embedding_labeled, mask_labeled)
+        unlabeled_pred = net(embedding_unlabeled, mask_unlabeled)
+        loss = loss_fn(labeled_pred, label) + (unlabeled_pred - guess) ** 2
         epoch_loss += loss.item()
 
         optimizer.zero_grad()
@@ -329,7 +265,7 @@ def gmm_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
     loss_fn: nn.Module,
-    regression_loss_fn: nn.Module = None,
+    task: str = "binary",  # options: "binary", "multi_class", "multi_label", "regression"
     device: torch.device = torch.device("cuda"),
 ):
     net.eval()
@@ -339,10 +275,13 @@ def gmm_iteration(
             input_dict = to_device(input_dict, device)
 
             pred = net(input_dict['embedding'], input_dict['mask'])
-            if regression_loss_fn is not None:
-                loss = regression_loss_fn(pred, input_dict['label'].view(-1, 1))
-            else:
-                loss = loss_fn(pred, input_dict['label'])
+            label = input_dict['label']
+            if task == "regression":
+                pred = pred.view(-1, 1)
+                label = label.view(-1, 1)
+            elif task == "multi_label":
+                label = label.float()
+            loss = loss_fn(pred, label)
             losses.append(loss)
 
     losses = torch.cat(losses, dim=0)
@@ -355,38 +294,12 @@ def gmm_iteration(
     return gmm.predict_proba(losses)[:, gmm.means_.argmin()], losses
 
 
-def val_iteration(
-    net_1: nn.Module,
-    net_2: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    device: torch.device = torch.device("cuda"),
-):
-    net_1.eval()
-    net_2.eval()
-
-    correct, total = 0, 0
-    with torch.no_grad():
-        for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
-            input_dict = to_device(input_dict, device)
-
-            pred = net_1(input_dict['embedding'], input_dict['mask'])
-            pred += net_2(input_dict['embedding'], input_dict['mask'])
-            _, predicted = torch.max(pred, 1)
-
-            total += input_dict['label'].size(0)
-            correct += (predicted == input_dict['label']).sum().item()
-
-    return 100. * correct / total
-
-
 def baseline_train_iteration(
     net: nn.Module,
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.Module,
-    penalty_fn: NegEntropy,
-    reg_loss_fn: nn.Module,
     dataloader: torch.utils.data.DataLoader,
-    regression: bool = False,
+    task: str = "binary",  # options: "binary", "multi_class", "multi_label", "regression"
     device: torch.device = torch.device("cuda"),
 ):
     net.train()
@@ -397,11 +310,13 @@ def baseline_train_iteration(
         input_dict = to_device(input_dict, device)
 
         pred = net(input_dict['embedding'], input_dict['mask'])
-
-        if regression:
-            loss = reg_loss_fn(pred, input_dict['label'].view(-1, 1))
-        else:
-            loss = loss_fn(pred, input_dict['label']) + penalty_fn(pred)
+        label = input_dict['label']
+        if task == "regression":
+            pred = pred.view(-1, 1)
+            label = label.view(-1, 1)
+        elif task == "multi_label":
+            label = label.float()
+        loss = loss_fn(pred, label)
         epoch_loss += loss.item()
 
         optimizer.zero_grad()
@@ -413,33 +328,65 @@ def baseline_train_iteration(
 def baseline_val_iteration(
     net: nn.Module,
     loader: torch.utils.data.DataLoader,
-    regression: bool = False,
+    task: str = "single_label",
     device: torch.device = torch.device("cuda"),
 ):
     net.eval()
 
-    error, total = 0, 0
+    pred = []
     with torch.no_grad():
         for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
-
-            pred = net(input_dict['embedding'], input_dict['mask'])
-
-            if regression:
-                error += torch.mean(torch.abs(pred - input_dict['label'].view(-1, 1))).item()
-                total += input_dict['label'].size(0)
-            else:
-                _, predicted = torch.max(pred, 1)
-                acc = accuracy(predicted, input_dict['label'])
-                pre = precision(predicted, input_dict['label'])
-                rec = recall(predicted, input_dict['label'])
-                f1 = f1_score(predicted, input_dict['label'])
-                auc_score = auc(predicted, input_dict['label'])
-                mcc_score = mcc(predicted, input_dict['label'])
-
-    if regression:
-        return error / total
-    return acc, pre, rec, f1, auc_score, mcc_score
+            pred.append(net(input_dict['embedding'], input_dict['mask']).detach().cpu())
+    pred = torch.cat(pred, dim=0)
+    if task == "binary":
+        softmax_pred = torch.softmax(pred, dim=1)
+        auc = BinaryAUROC(compute_on_step=False).to(device)
+        acc = BinaryAccuracy(compute_on_step=False).to(device)
+        recall = BinaryRecall(compute_on_step=False).to(device)
+        precision = BinaryPrecision(compute_on_step=False).to(device)
+        f1 = BinaryF1Score(compute_on_step=False).to(device)
+        mcc = BinaryMatthewsCorrCoef(compute_on_step=False).to(device)
+        metrics = {
+            "auc": auc(pred, input_dict['label']),
+            "acc": acc(softmax_pred, input_dict['label']),
+            "recall": recall(softmax_pred, input_dict['label']),
+            "precision": precision(softmax_pred, input_dict['label']),
+            "f1": f1(softmax_pred, input_dict['label']),
+            "mcc": mcc(softmax_pred, input_dict['label']),
+        }
+    elif task == "multi_class":
+        softmax_pred = torch.softmax(pred, dim=1)
+        auc = AUROC(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        acc = Accuracy(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        recall = Recall(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        precision = Precision(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        f1 = F1Scor(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        mcc = MatthewsCorrCoef(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        metrics = {
+            "auc": auc(pred, input_dict['label']),
+            "acc": acc(softmax_pred, input_dict['label']),
+            "recall": recall(softmax_pred, input_dict['label']),
+            "precision": precision(softmax_pred, input_dict['label']),
+            "f1": f1(softmax_pred, input_dict['label']),
+            "mcc": mcc(softmax_pred, input_dict['label']),
+        }
+    elif task == "multi_label":
+        pred = torch.sigmoid(pred)
+        max_f1 = MultilabelF1Max(num_labels=pred.shape[-1], compute_on_step=False).to(device)
+        metrics = {
+            "max_f1": max_f1(pred, input_dict['label']),
+        }
+    elif task == "regression":
+        pred = pred.view(-1, 1)
+        label = input_dict['label'].view(-1, 1)
+        mse = MeanSquaredError(compute_on_step=False).to(device)
+        spearman = SpearmanCorrCoef(compute_on_step=False).to(device)
+        metrics = {
+            "mse": mse(pred, input_dict['label']),
+            "spearman": spearman(pred, input_dict['label']),
+        }
+    return metrics
 
 
 def pad(

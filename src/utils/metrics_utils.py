@@ -1,69 +1,53 @@
 import torch
-from sklearn.metrics import roc_auc_score
+from torchmetrics.classification import MultilabelAveragePrecision
 
 
-def accuracy(pred: torch.Tensor, target: torch.Tensor) -> float:
+def count_f1_max(pred, target):
     """
-    Calculate the accuracy of the predictions.
+    F1 score with the optimal threshold, Copied from TorchDrug.
+
+    This function first enumerates all possible thresholds for deciding positive and negative
+    samples, and then pick the threshold with the maximal F1 score.
+
+    Parameters:
+        pred (Tensor): predictions of shape :math:`(B, N)`
+        target (Tensor): binary targets of shape :math:`(B, N)`
     """
-    pred = pred.view(-1)
-    target = target.view(-1)
-    correct = (pred == target).sum().item()
-    total = target.numel()
-    return correct / total if total > 0 else 0.0
+
+    order = pred.argsort(descending=True, dim=1)
+    target = target.gather(1, order)
+    precision = target.cumsum(1) / torch.ones_like(target).cumsum(1)
+    recall = target.cumsum(1) / (target.sum(1, keepdim=True) + 1e-10)
+    is_start = torch.zeros_like(target).bool()
+    is_start[:, 0] = 1
+    is_start = torch.scatter(is_start, 1, order, is_start)
+
+    all_order = pred.flatten().argsort(descending=True)
+    order = (
+        order
+        + torch.arange(order.shape[0], device=order.device).unsqueeze(1)
+        * order.shape[1]
+    )
+    order = order.flatten()
+    inv_order = torch.zeros_like(order)
+    inv_order[order] = torch.arange(order.shape[0], device=order.device)
+    is_start = is_start.flatten()[all_order]
+    all_order = inv_order[all_order]
+    precision = precision.flatten()
+    recall = recall.flatten()
+    all_precision = precision[all_order] - torch.where(
+        is_start, torch.zeros_like(precision), precision[all_order - 1]
+    )
+    all_precision = all_precision.cumsum(0) / is_start.cumsum(0)
+    all_recall = recall[all_order] - torch.where(
+        is_start, torch.zeros_like(recall), recall[all_order - 1]
+    )
+    all_recall = all_recall.cumsum(0) / pred.shape[0]
+    all_f1 = 2 * all_precision * all_recall / (all_precision + all_recall + 1e-10)
+    return all_f1.max()
 
 
-def precision(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    Calculate the precision of the predictions.
-    """
-    pred = pred.view(-1)
-    target = target.view(-1)
-    true_positive = (pred * target).sum().item()
-    predicted_positive = pred.sum().item()
-    return true_positive / predicted_positive if predicted_positive > 0 else 0.0
+class MultilabelF1Max(MultilabelAveragePrecision):
 
-
-def recall(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    Calculate the recall of the predictions.
-    """
-    pred = pred.view(-1)
-    target = target.view(-1)
-    true_positive = (pred * target).sum().item()
-    actual_positive = target.sum().item()
-    return true_positive / actual_positive if actual_positive > 0 else 0.0
-
-
-def f1_score(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    Calculate the F1 score of the predictions.
-    """
-    p = precision(pred, target)
-    r = recall(pred, target)
-    return 2 * (p * r) / (p + r) if (p + r) > 0 else 0.0
-
-
-def auc(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    Calculate the area under the curve (AUC) of the predictions.
-    """
-    pred = pred.view(-1).cpu().numpy()
-    target = target.view(-1).cpu().numpy()
-    return roc_auc_score(target, pred)
-
-
-def mcc(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    Calculate the Matthews correlation coefficient (MCC) of the predictions.
-    """
-    pred = pred.view(-1)
-    target = target.view(-1)
-    tp = (pred * target).sum().item()
-    tn = ((1 - pred) * (1 - target)).sum().item()
-    fp = (pred * (1 - target)).sum().item()
-    fn = ((1 - pred) * target).sum().item()
-
-    numerator = (tp * tn) - (fp * fn)
-    denominator = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
-    return numerator / denominator if denominator > 0 else 0.0
+    def compute(self):
+        return count_f1_max(torch.cat(self.preds), torch.cat(self.target))
