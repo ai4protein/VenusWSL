@@ -87,7 +87,7 @@ def get_embeddings(seq_path,
                   emb_path,
                   model_name_or_path,
                   model_dir=None,
-                  per_protein=True,
+                  pooling_type=None,  # None, 'mean', 'max'
                   max_residues=4000,
                   max_seq_len=1000,
                   max_batch=100,
@@ -98,6 +98,10 @@ def get_embeddings(seq_path,
     Args:
         chunk_id: 当前处理的块ID (从0开始)
         total_chunks: 总块数
+        pooling_type: 
+            - None: return per-residue embeddings (seq_len x dim)
+            - 'mean': return mean-pooled embedding (dim)
+            - 'max': return max-pooled embedding (dim)
     """
     
     # Read sequences
@@ -165,28 +169,35 @@ def get_embeddings(seq_path,
             try:
                 with torch.no_grad():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    features = outputs.last_hidden_state
+                    features = outputs.last_hidden_state  # [batch_size, seq_len, hidden_dim]
                     
-                    # Apply attention mask and compute mean pooling
-                    masked_features = features * attention_mask.unsqueeze(2)
-                    sum_features = torch.sum(masked_features, dim=1)
-                    mean_pooled_features = sum_features / attention_mask.sum(dim=1, keepdim=True)
-
                     # Save embeddings
                     for batch_idx, identifier in enumerate(pdb_ids):
-                        emb = mean_pooled_features[batch_idx]
-                        if not per_protein:
-                            emb = features[batch_idx, :seq_lens[batch_idx]]
+                        seq_len = seq_lens[batch_idx]
+                        # Get the sequence embeddings (excluding padding)
+                        seq_emb = features[batch_idx, :seq_len]  # [seq_len, hidden_dim]
+                        
+                        if pooling_type == 'mean':
+                            # Mean pooling
+                            emb = seq_emb.mean(dim=0)  # [hidden_dim]
+                        elif pooling_type == 'max':
+                            # Max pooling
+                            emb = seq_emb.max(dim=0)[0]  # [hidden_dim]
+                        else:  # None
+                            # Return per-residue embeddings
+                            emb = seq_emb  # [seq_len, hidden_dim]
 
                         if batch_idx == 0:
                             print("Embedded protein {} with length {} to emb. of shape: {}".format(
-                                identifier, seq_lens[batch_idx], emb.shape))
+                                identifier, seq_len, emb.shape))
 
                         # Save embedding
                         embedding_path = os.path.join(emb_path, f"{identifier}.pkl.gz")
                         with gzip.open(embedding_path, "wb") as f:
                             pickle.dump({
                                 'representation': emb.detach().cpu().numpy().squeeze(),
+                                'pooling_type': pooling_type,
+                                'sequence_length': seq_len
                             }, f)
                         processed_count += 1
 
@@ -217,7 +228,10 @@ def main():
                         ], 
                         help='Name of the pre-trained model to use')
     parser.add_argument('--model_dir', type=str, default=None, help='Path to directory holding the checkpoint for a pre-trained model')
-    parser.add_argument('--per_protein', type=int, default=1, help='Whether to return per-residue embeddings (0) or mean-pooled per-protein representation (1)')
+    parser.add_argument('--pooling_type', type=str, 
+                        choices=['mean', 'max', 'none'],
+                        default='none',
+                        help='Pooling strategy for sequence embeddings: mean, max, or none (per-residue)')
     parser.add_argument('--chunk_id', type=int, help='Chunk ID to process (0-based)')
     parser.add_argument('--total_chunks', type=int, help='Total number of chunks')
     args = parser.parse_args()
@@ -228,12 +242,15 @@ def main():
 
     os.makedirs(emb_path, exist_ok=True)
     
+    # Convert 'none' to None for the pooling_type
+    pooling_type = None if args.pooling_type == 'none' else args.pooling_type
+
     get_embeddings(
         seq_path=seq_path,
         emb_path=emb_path,
         model_name_or_path=args.model_name_or_path,
         model_dir=model_dir,
-        per_protein=bool(args.per_protein),
+        pooling_type=pooling_type,
         chunk_id=args.chunk_id,
         total_chunks=args.total_chunks
     )

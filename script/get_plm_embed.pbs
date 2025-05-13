@@ -1,19 +1,26 @@
+#PBS -q ai4090
+#PBS -l walltime=168:00:00
+#PBS -l select=1:ncpus=6:ngpus=1:mem=64gb
+#PBS -N wsl_ankh_emb9
+#PBS -o /home/tanyang/workspace/VenusWSL/log
+#PBS -e /home/tanyang/workspace/VenusWSL/log
+
 # model_name_or_path:
 #   Rostlab/prot_bert, Rostlab/prot_bert_bfd
 #   facebook/esm2_t30_150M_UR50D, facebook/esm2_t33_650M_UR50D
 #   Rostlab/prot_t5_xl_uniref50, Rostlab/prot_t5_xl_bfd
 #   ElnaggarLab/ankh-large, ElnaggarLab/ankh-base
 
+zsh
+source ~/.zshrc
+cd /home/tanyang/workspace/VenusWSL
+source /home/tanyang/miniconda3/etc/profile.d/conda.sh
+conda activate protrem
+
+
 CUDA_VISIBLE_DEVICES=0 python get_plm_embed.py \
     --input dataset/all_seqs.fasta \
     --output results/all_seqs_ankh-large \
     --model_name_or_path ElnaggarLab/ankh-large \
-    --chunk_id 0 \
-    --total_chunks 1
-
-CUDA_VISIBLE_DEVICES=0 python get_plm_embed.py \
-    --input dataset/all_seqs.fasta \
-    --output results/all_seqs_prot_bert \
-    --model_name_or_path Rostlab/prot_bert \
-    --chunk_id 0 \
-    --total_chunks 1
+    --chunk_id 9 \
+    --total_chunks 10
