@@ -4,12 +4,11 @@ import numpy as np
 import tqdm
 from sklearn.mixture import GaussianMixture
 
-from torchmetrics.classification import Accuracy, Recall, Precision, MatthewsCorrCoef, AUROC, F1Scor
+from torchmetrics.classification import Accuracy, Recall, Precision, MatthewsCorrCoef, AUROC, F1Score
 from torchmetrics.classification import BinaryAccuracy, BinaryRecall, BinaryAUROC, BinaryF1Score, BinaryPrecision, BinaryMatthewsCorrCoef, BinaryF1Score
 from torchmetrics.regression import SpearmanCorrCoef, MeanSquaredError
 
 from src.data.dataset import DataAugment
-from src.model.loss import NegEntropy
 from src.utils.metrics_utils import MultilabelF1Max
 
 
@@ -200,9 +199,9 @@ def simple_train_iteration(
 
             # pad to same length
             if labeled_input_dict['embedding'].shape[1] < max_token:
-                labeled_input_dict = pad(labeled_input_dict, max_token)
+                labeled_input_dict = pad(labeled_input_dict, max_token, task)
             elif unlabeled_input_dict['embedding'].shape[1] < max_token:
-                unlabeled_input_dict = pad(unlabeled_input_dict, max_token)
+                unlabeled_input_dict = pad(unlabeled_input_dict, max_token, task)
 
             if labeled_input_dict['embedding'].shape[0] != unlabeled_input_dict['embedding'].shape[0]:
                 continue
@@ -226,8 +225,9 @@ def simple_train_iteration(
         # pseudo label generation
         with torch.no_grad():
             if task == "regression":
-                label_pseudo = teacher(embedding_labeled, mask_labeled)
-                label = w_clean * label.view(-1, 1) + (1 - w_clean) * label_pseudo
+                label = label.view(-1, 1)
+                # label_pseudo = teacher(embedding_labeled, mask_labeled)
+                # label = (w_clean * label.view(-1, 1) + (1 - w_clean) * label_pseudo).float()
                 guess = teacher(embedding_unlabeled, mask_unlabeled)
             else:
                 output_labeled = teacher(embedding_labeled, mask_labeled)
@@ -241,7 +241,7 @@ def simple_train_iteration(
                     guess = torch.softmax(output_unlabeled, dim=1)
                 elif task == "multi_label":
                     label_pseudo = torch.sigmoid(output_labeled)
-                    label = w_clean * label + (1 - w_clean) * label_pseudo
+                    label = w_clean * label.float() + (1 - w_clean) * label_pseudo
                     label = label ** (1 / 0.5)
                     label = label / label.sum(dim=1, keepdim=True)
                     guess = torch.sigmoid(output_unlabeled)
@@ -251,7 +251,7 @@ def simple_train_iteration(
 
         labeled_pred = net(embedding_labeled, mask_labeled)
         unlabeled_pred = net(embedding_unlabeled, mask_unlabeled)
-        loss = loss_fn(labeled_pred, label) + (unlabeled_pred - guess) ** 2
+        loss = loss_fn(labeled_pred, label) + torch.mean((unlabeled_pred - guess) ** 2)
         epoch_loss += loss.item()
 
         optimizer.zero_grad()
@@ -282,6 +282,8 @@ def gmm_iteration(
             elif task == "multi_label":
                 label = label.float()
             loss = loss_fn(pred, label)
+            if task == "multi_label":
+                loss = torch.mean(loss, dim=-1)
             losses.append(loss)
 
     losses = torch.cat(losses, dim=0)
@@ -333,58 +335,60 @@ def baseline_val_iteration(
 ):
     net.eval()
 
-    pred = []
+    pred, label = [], []
     with torch.no_grad():
         for batch_idx, input_dict in tqdm.tqdm(enumerate(loader), desc="Validation Iteration", leave=True):
             input_dict = to_device(input_dict, device)
-            pred.append(net(input_dict['embedding'], input_dict['mask']).detach().cpu())
+            pred.append(net(input_dict['embedding'], input_dict['mask']).detach())
+            label.append(input_dict['label'].detach())
     pred = torch.cat(pred, dim=0)
+    label = torch.cat(label, dim=0)
     if task == "binary":
-        softmax_pred = torch.softmax(pred, dim=1)
-        auc = BinaryAUROC(compute_on_step=False).to(device)
-        acc = BinaryAccuracy(compute_on_step=False).to(device)
-        recall = BinaryRecall(compute_on_step=False).to(device)
-        precision = BinaryPrecision(compute_on_step=False).to(device)
-        f1 = BinaryF1Score(compute_on_step=False).to(device)
-        mcc = BinaryMatthewsCorrCoef(compute_on_step=False).to(device)
+        argmax_pred = torch.argmax(pred, dim=1)
+        auc = BinaryAUROC().to(device)
+        acc = BinaryAccuracy().to(device)
+        recall = BinaryRecall().to(device)
+        precision = BinaryPrecision().to(device)
+        f1 = BinaryF1Score().to(device)
+        mcc = BinaryMatthewsCorrCoef().to(device)
         metrics = {
-            "auc": auc(pred, input_dict['label']),
-            "acc": acc(softmax_pred, input_dict['label']),
-            "recall": recall(softmax_pred, input_dict['label']),
-            "precision": precision(softmax_pred, input_dict['label']),
-            "f1": f1(softmax_pred, input_dict['label']),
-            "mcc": mcc(softmax_pred, input_dict['label']),
+            "auc": auc(torch.sigmoid(pred[:, 1]), label),
+            "acc": acc(argmax_pred, label),
+            "recall": recall(argmax_pred, label),
+            "precision": precision(argmax_pred, label),
+            "f1": f1(argmax_pred, label),
+            "mcc": mcc(argmax_pred, label),
         }
     elif task == "multi_class":
-        softmax_pred = torch.softmax(pred, dim=1)
-        auc = AUROC(num_classes=pred.shape[-1], compute_on_step=False).to(device)
-        acc = Accuracy(num_classes=pred.shape[-1], compute_on_step=False).to(device)
-        recall = Recall(num_classes=pred.shape[-1], compute_on_step=False).to(device)
-        precision = Precision(num_classes=pred.shape[-1], compute_on_step=False).to(device)
-        f1 = F1Scor(num_classes=pred.shape[-1], compute_on_step=False).to(device)
-        mcc = MatthewsCorrCoef(num_classes=pred.shape[-1], compute_on_step=False).to(device)
+        argmax_pred = torch.argmax(pred, dim=1)
+        auc = AUROC(task='multiclass', num_classes=pred.shape[-1]).to(device)
+        acc = Accuracy(task='multiclass', num_classes=pred.shape[-1]).to(device)
+        recall = Recall(task='multiclass', num_classes=pred.shape[-1]).to(device)
+        precision = Precision(task='multiclass', num_classes=pred.shape[-1]).to(device)
+        f1 = F1Score(task='multiclass', num_classes=pred.shape[-1]).to(device)
+        mcc = MatthewsCorrCoef(task='multiclass', num_classes=pred.shape[-1]).to(device)
         metrics = {
-            "auc": auc(pred, input_dict['label']),
-            "acc": acc(softmax_pred, input_dict['label']),
-            "recall": recall(softmax_pred, input_dict['label']),
-            "precision": precision(softmax_pred, input_dict['label']),
-            "f1": f1(softmax_pred, input_dict['label']),
-            "mcc": mcc(softmax_pred, input_dict['label']),
+            "auc": auc(torch.softmax(pred, dim=1), label),
+            "acc": acc(argmax_pred, label),
+            "recall": recall(argmax_pred, label),
+            "precision": precision(argmax_pred, label),
+            "f1": f1(argmax_pred, label),
+            "mcc": mcc(argmax_pred, label),
         }
     elif task == "multi_label":
         pred = torch.sigmoid(pred)
-        max_f1 = MultilabelF1Max(num_labels=pred.shape[-1], compute_on_step=False).to(device)
+        max_f1 = MultilabelF1Max(num_labels=pred.shape[-1]).to(device)
         metrics = {
-            "max_f1": max_f1(pred, input_dict['label']),
+            "max_f1": max_f1(pred, label),
         }
     elif task == "regression":
         pred = pred.view(-1, 1)
-        label = input_dict['label'].view(-1, 1)
-        mse = MeanSquaredError(compute_on_step=False).to(device)
-        spearman = SpearmanCorrCoef(compute_on_step=False).to(device)
+        label = label.view(-1, 1)
+        mse = MeanSquaredError().to(device)
+        spearman = SpearmanCorrCoef().to(device)
         metrics = {
-            "mse": mse(pred, input_dict['label']),
-            "spearman": spearman(pred, input_dict['label']),
+            "mse": mse(pred, label),
+            "spearman": spearman(pred, label),
         }
     return metrics
 
@@ -392,11 +396,14 @@ def baseline_val_iteration(
 def pad(
     input_feature_dict: dict,
     max_seq_len: int,
+    task: str = "binary",  # options: "binary", "multi_class", "multi_label", "regression"
 ):
     for k, v in input_feature_dict.items():
         if len(v.shape) == 1:
             input_feature_dict[k] = v
         elif len(v.shape) == 2:
+            if task == "multi_label" and k == "label":
+                continue
             input_feature_dict[k] = torch.cat(
                 [v, torch.zeros(v.shape[0], max_seq_len - v.shape[1]).to(v.device)],
                 dim=1)

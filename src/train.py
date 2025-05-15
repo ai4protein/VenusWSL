@@ -4,7 +4,6 @@ import os
 import warnings
 
 import hydra
-import pandas as pd
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -15,13 +14,11 @@ import rootutils
 
 from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
-from src.model.loss import NegEntropy, LabeledDataLoss, UnlabeledDataLoss, PriorPenalty
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 from src.utils.training_utils import (baseline_train_iteration,
                                       baseline_val_iteration,
                                       gmm_iteration,
                                       train_iteration,
-                                      val_iteration,
                                       simple_train_iteration)
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -74,9 +71,11 @@ def train(args: DictConfig):
         deterministic=args.deterministic,
     )
 
+    task = args.training.task
     labeled_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_training_set,
         num_classes=args.model.label_dim,
+        task=task,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -87,6 +86,7 @@ def train(args: DictConfig):
     teacher_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_teaching_set,  # use a different dataset for teacher model
         num_classes=args.model.label_dim,
+        task=task,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -97,6 +97,7 @@ def train(args: DictConfig):
     val_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_validation_set,
         num_classes=args.model.label_dim,
+        task=task,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -132,7 +133,6 @@ def train(args: DictConfig):
         lr=args.optimizer.lr,
     )
 
-    task = args.training.task
     if task == "binary" or task == "multi_class":
         baseline_loss = nn.CrossEntropyLoss()
         gmm_loss = nn.CrossEntropyLoss(reduction="none")
@@ -217,6 +217,7 @@ def train(args: DictConfig):
         gmm_dataset = ProteinDataset(
             path_to_dataset=args.data.path_to_training_set,
             num_classes=args.model.label_dim,
+            task=task,
             max_seq_len=args.data.max_seq_len,
             batch_size=args.batch_size,
             collate_fn=BatchTensorConverter(),
@@ -248,13 +249,13 @@ def train(args: DictConfig):
             val_metrics = baseline_val_iteration(
                 model_1,
                 val_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
             teacher_metrics = baseline_val_iteration(
                 model_1,
                 teacher_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
             if DIST_WRAPPER.rank == 0:
@@ -291,23 +292,23 @@ def train(args: DictConfig):
                 model_2,
                 model_1,
                 optimizer_2,
+                baseline_loss,
                 labeled_dataloader,
                 unlabeled_dataloader,
-                augment_samples=args.training.augmented_samples,
                 num_labels=args.model.label_dim,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
             val_metrics = baseline_val_iteration(
                 model_2,
                 val_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
             teacher_metrics = baseline_val_iteration(
                 model_2,
                 teacher_dataloader,
-                regression=args.training.regression,
+                task=task,
                 device=device,
             )
 

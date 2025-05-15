@@ -2,13 +2,28 @@ import copy
 import pickle
 from typing import Dict, Optional, List, Sequence, Callable
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 DTYPE_MAPPING = {
-    'label': torch.float32,
-    'embedding': torch.float32,
+    'binary': {
+        'label': torch.int64,
+        'embedding': torch.float32,
+    },
+    'multi_class': {
+        'label': torch.int64,
+        'embedding': torch.float32,
+    },
+    'multi_label': {
+        'label': torch.int64,
+        'embedding': torch.float32,
+    },
+    'regression': {
+        'label': torch.float32,
+        'embedding': torch.float32,
+    }
 }
 
 
@@ -69,6 +84,7 @@ class ProteinDataset(Dataset):
     def __init__(self,
         path_to_dataset: str,
         num_classes: int = 10,
+        task: str = 'binary',
         min_seq_len: int = 20,
         max_seq_len: int = 1024,
         batch_size: int = 32,
@@ -92,6 +108,7 @@ class ProteinDataset(Dataset):
 
         # dataloader arguments
         self.num_classes = num_classes
+        self.task = task
         self.batch_size = batch_size
         self.collate_fn = collate_fn
         self.shuffle = shuffle
@@ -105,10 +122,11 @@ class ProteinDataset(Dataset):
         # sequence = self.data[idx]['aa_seq']
         label = self.data_to_iter['label'][idx]
 
-        if len(label.split(',')) > 1:
-            label_ = [0.] * self.num_classes
-            for l in label.split(','):
-                label_[int(l)] = 1.
+        if self.task == 'multi_label':
+            label_ = [0] * self.num_classes
+            for l in str(label).split(','):
+                label_[int(l)] = 1
+            label = np.array(label_)
 
         embedding_path = self.data_to_iter['embedding_path'][idx]
         if embedding_path.endswith('.pt'):
@@ -150,11 +168,10 @@ class ProteinDataset(Dataset):
     def clone(self):
         return copy.deepcopy(self)
 
-    @staticmethod
-    def map_to_tensors(chain_feats):
+    def map_to_tensors(self, chain_feats):
         chain_feats = {k: torch.as_tensor(v) for k, v in chain_feats.items()}
         # Alter dtype
-        for k, dtype in DTYPE_MAPPING.items():
+        for k, dtype in DTYPE_MAPPING[self.task].items():
             if k in chain_feats:
                 chain_feats[k] = chain_feats[k].type(dtype)
         return chain_feats
