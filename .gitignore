@@ -163,6 +163,7 @@ cython_debug/
 
 
 data/PDBSol
+data/PDBSol_sub
 ckpt/
 log/
 dataset/

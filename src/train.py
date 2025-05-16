@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import DictConfig, OmegaConf
 import rootutils
+from datasets import load_dataset
 
 from src.data.dataset import DataAugment, ProteinDataset, BatchTensorConverter
 from src.model.VenusWSL import PredictorPLM
@@ -24,6 +25,99 @@ from src.utils.training_utils import (baseline_train_iteration,
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+
+def get_dataset(args):
+    """load dataset and convert to ProteinDataset"""
+    if args.data.dataset_type == "hf":
+        # load Huggingface dataset
+        train_dataset = load_dataset(args.data.hf_dataset, split="train")
+        val_dataset = load_dataset(args.data.hf_dataset, split="validation")
+        teacher_dataset = load_dataset(args.data.hf_dataset, split="train")
+        
+        # convert to ProteinDataset
+        train_dataset = ProteinDataset(
+            dataset=train_dataset,
+            sequence_column=args.data.sequence_column,
+            id_column=args.data.id_column,
+            label_column=args.data.label_column,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=args.data.shuffle,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+        
+        val_dataset = ProteinDataset(
+            dataset=val_dataset,
+            sequence_column=args.data.sequence_column,
+            id_column=args.data.id_column,
+            label_column=args.data.label_column,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=False,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+        
+        teacher_dataset = ProteinDataset(
+            dataset=teacher_dataset,
+            sequence_column=args.data.sequence_column,
+            id_column=args.data.id_column,
+            label_column=args.data.label_column,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=args.data.shuffle,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+    else:
+        # use local dataset
+        train_dataset = ProteinDataset(
+            path_to_dataset=args.data.path_to_training_set,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=args.data.shuffle,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+        
+        val_dataset = ProteinDataset(
+            path_to_dataset=args.data.path_to_validation_set,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=False,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+        
+        teacher_dataset = ProteinDataset(
+            path_to_dataset=args.data.path_to_teaching_set,
+            num_classes=args.model.label_dim,
+            task=args.training.task,
+            max_seq_len=args.data.max_seq_len,
+            batch_size=args.batch_size,
+            collate_fn=BatchTensorConverter(),
+            shuffle=args.data.shuffle,
+            num_workers=args.data.num_workers,
+            pin_memory=args.data.pin_memory,
+        )
+    
+    return train_dataset, val_dataset, teacher_dataset
 
 @hydra.main(version_base="1.3", config_path="../config", config_name="train")
 def train(args: DictConfig):
@@ -72,39 +166,7 @@ def train(args: DictConfig):
     )
 
     task = args.training.task
-    labeled_dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_training_set,
-        num_classes=args.model.label_dim,
-        task=task,
-        max_seq_len=args.data.max_seq_len,
-        batch_size=args.batch_size,
-        collate_fn=BatchTensorConverter(),
-        shuffle=args.data.shuffle,
-        num_workers=args.data.num_workers,
-        pin_memory=args.data.pin_memory,
-    )
-    teacher_dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_teaching_set,  # use a different dataset for teacher model
-        num_classes=args.model.label_dim,
-        task=task,
-        max_seq_len=args.data.max_seq_len,
-        batch_size=args.batch_size,
-        collate_fn=BatchTensorConverter(),
-        shuffle=args.data.shuffle,
-        num_workers=args.data.num_workers,
-        pin_memory=args.data.pin_memory,
-    )
-    val_dataset = ProteinDataset(
-        path_to_dataset=args.data.path_to_validation_set,
-        num_classes=args.model.label_dim,
-        task=task,
-        max_seq_len=args.data.max_seq_len,
-        batch_size=args.batch_size,
-        collate_fn=BatchTensorConverter(),
-        shuffle=False,
-        num_workers=args.data.num_workers,
-        pin_memory=args.data.pin_memory,
-    )
+    labeled_dataset, val_dataset, teacher_dataset = get_dataset(args)
 
     labeled_dataloader = labeled_dataset.get_dataloader()
     teacher_dataloader = teacher_dataset.get_dataloader()

@@ -1,4 +1,3 @@
-
 epochs: 100
 batch_size: 32
 logging_dir: './logs'
@@ -6,7 +5,7 @@ seed: 37
 deterministic: False
 
 training:
-  task: "single_label"
+  task: "binary"  # binary, multi_class, regression, multi_label
   baseline: True
   save_interval: 10
   warmup_epochs: 10
@@ -18,8 +17,18 @@ training:
   alpha: 0.5
 
 data:
+  # dataset config
+  dataset_type: "hf"  # hf or local
+  hf_dataset: "AI4Protein/DeepLocBinary"  # Huggingface dataset name
+  sequence_column: "aa_seq"  # sequence column name
+  id_column: "name"  # ID column name
+  label_column: "label"  # label column name
+  
+  # local dataset path (when dataset_type is local)
   path_to_training_set: './data/train'
   path_to_validation_set: './data/val'
+  path_to_teaching_set: './data/train'  # for teacher model
+  
   max_seq_len: 2580
   shuffle: True
   num_workers: 32

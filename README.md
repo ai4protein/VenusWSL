@@ -23,3 +23,21 @@ conda activate venuswsl
 We recommend using a GPU with at least 12GB memory.
 
 ## 🧬 Start with VenusWSL
+
+### Get PLM Embedding
+
+```bash
+bash script/get_plm_embedding.sh
+```
+
+### Train with VenusWSL
+
+```bash
+bash script/train.sh
+```
+
+## 🙌 Citation
+if you find this work useful, please cite:
+```bibtex
+
+}
