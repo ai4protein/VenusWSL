@@ -19,6 +19,8 @@ from transformers import (
     T5EncoderModel
 )
 from tqdm import tqdm
+from datasets import load_dataset
+import numpy as np
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print("Using device: {}".format(device))
@@ -107,7 +109,7 @@ def get_embeddings(seq_path,
     # Read sequences
     seq_dict = read_fasta(seq_path)
     
-    # 如果指定了分块，则只处理对应的块
+    # process specific chunk
     if chunk_id is not None and total_chunks is not None:
         total_seqs = len(seq_dict)
         chunk_size = total_seqs // total_chunks
@@ -214,10 +216,214 @@ def get_embeddings(seq_path,
     print(f'Average sequence length: {avg_length:.2f}')
     return True
 
+def get_embeddings_from_hf(dataset_name,
+                          split=None,  # 改为可选参数
+                          emb_path=None,
+                          model_name_or_path=None,
+                          model_dir=None,
+                          pooling_type=None,
+                          max_residues=4000,
+                          max_seq_len=1000,
+                          max_batch=100,
+                          chunk_id=None,
+                          total_chunks=None,
+                          sequence_column='sequence',
+                          id_column='id'):
+    """Extract embeddings from Huggingface dataset
+    
+    Args:
+        dataset_name: Huggingface dataset name
+        split: Dataset split to use. If None, process all splits (train, validation, test)
+        sequence_column: Name of the column containing protein sequences
+        id_column: Name of the column containing protein IDs
+    """
+    # Load dataset
+    if split is None:
+        # 处理所有split
+        splits = ['train', 'validation', 'test']
+        for current_split in splits:
+            try:
+                print(f"\nProcessing split: {current_split}")
+                current_emb_path = os.path.join(emb_path, current_split)
+                os.makedirs(current_emb_path, exist_ok=True)
+                
+                dataset = load_dataset(dataset_name, split=current_split)
+                process_dataset_split(
+                    dataset=dataset,
+                    emb_path=current_emb_path,
+                    model_name_or_path=model_name_or_path,
+                    model_dir=model_dir,
+                    pooling_type=pooling_type,
+                    max_residues=max_residues,
+                    max_seq_len=max_seq_len,
+                    max_batch=max_batch,
+                    chunk_id=chunk_id,
+                    total_chunks=total_chunks,
+                    sequence_column=sequence_column,
+                    id_column=id_column,
+                    split_name=current_split
+                )
+            except Exception as e:
+                print(f"Error processing split {current_split}: {str(e)}")
+                continue
+    else:
+        # 处理单个split
+        print(f"Loading dataset {dataset_name} split {split}")
+        dataset = load_dataset(dataset_name, split=split)
+        process_dataset_split(
+            dataset=dataset,
+            emb_path=emb_path,
+            model_name_or_path=model_name_or_path,
+            model_dir=model_dir,
+            pooling_type=pooling_type,
+            max_residues=max_residues,
+            max_seq_len=max_seq_len,
+            max_batch=max_batch,
+            chunk_id=chunk_id,
+            total_chunks=total_chunks,
+            sequence_column=sequence_column,
+            id_column=id_column,
+            split_name=split
+        )
+
+def process_dataset_split(dataset,
+                         emb_path,
+                         model_name_or_path,
+                         model_dir=None,
+                         pooling_type=None,
+                         max_residues=4000,
+                         max_seq_len=1000,
+                         max_batch=100,
+                         chunk_id=None,
+                         total_chunks=None,
+                         sequence_column='sequence',
+                         id_column='id',
+                         split_name=None):
+    """Process a single dataset split"""
+    
+    # 如果指定了分块，则只处理对应的块
+    if chunk_id is not None and total_chunks is not None:
+        total_seqs = len(dataset)
+        chunk_size = total_seqs // total_chunks
+        start_idx = chunk_id * chunk_size
+        end_idx = start_idx + chunk_size if chunk_id < total_chunks - 1 else total_seqs
+        dataset = dataset.select(range(start_idx, end_idx))
+        print(f"Processing chunk {chunk_id + 1}/{total_chunks} (sequences {start_idx + 1}-{end_idx})")
+    
+    model, tokenizer = get_model_and_tokenizer(model_name_or_path, model_dir)
+
+    print('########################################')
+    print('Example sequence: {}\n{}'.format(dataset[0][id_column], dataset[0][sequence_column]))
+    print('########################################')
+    print('Total number of sequences: {}'.format(len(dataset)))
+
+    # Process sequences
+    seq_lens = [len(seq) for seq in dataset[sequence_column]]
+    avg_length = np.mean(seq_lens)
+    n_long = sum(1 for l in seq_lens if l > max_seq_len)
+
+    print("Average sequence length: {:.2f}".format(avg_length))
+    print("Number of sequences >{}: {}".format(max_seq_len, n_long))
+
+    start = time.time()
+    batch = list()
+    processed_count = 0
+    skipped_count = 0
+    
+    for idx, example in enumerate(tqdm(dataset, desc=f"Processing {split_name} sequences")):
+        pdb_id = example[id_column]
+        seq = example[sequence_column]
+        
+        # 检查embedding是否已存在
+        embedding_path = os.path.join(emb_path, f"{split_name}_{pdb_id}.pkl.gz")
+        if os.path.exists(embedding_path):
+            skipped_count += 1
+            continue
+
+        # Preprocess sequence based on model type
+        if 't5' in model_name_or_path:
+            seq = seq.replace('U', 'X').replace('Z', 'X').replace('O', 'X')
+        seq = ' '.join(list(seq))  # Convert sequence to space-separated string
+        seq_len = len(seq.split())  # Get actual sequence length after tokenization
+        batch.append((pdb_id, seq, seq_len))
+
+        n_res_batch = sum([s_len for _, _, s_len in batch]) + seq_len
+        if len(batch) >= max_batch or n_res_batch >= max_residues or idx == len(dataset) - 1 or seq_len > max_seq_len:
+            pdb_ids, seqs, seq_lens = zip(*batch)
+            batch = list()
+
+            # Tokenize sequences
+            token_encoding = tokenizer(seqs, 
+                                     add_special_tokens=True, 
+                                     padding="longest",
+                                     return_tensors="pt")
+            input_ids = token_encoding['input_ids'].to(device)
+            attention_mask = token_encoding['attention_mask'].to(device)
+
+            try:
+                with torch.no_grad():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    features = outputs.last_hidden_state  # [batch_size, seq_len, hidden_dim]
+                    
+                    # Save embeddings
+                    for batch_idx, identifier in enumerate(pdb_ids):
+                        seq_len = seq_lens[batch_idx]
+                        # Get the sequence embeddings (excluding padding)
+                        seq_emb = features[batch_idx, :seq_len]  # [seq_len, hidden_dim]
+                        
+                        if pooling_type == 'mean':
+                            # Mean pooling
+                            emb = seq_emb.mean(dim=0)  # [hidden_dim]
+                        elif pooling_type == 'max':
+                            # Max pooling
+                            emb = seq_emb.max(dim=0)[0]  # [hidden_dim]
+                        else:  # None
+                            # Return per-residue embeddings
+                            emb = seq_emb  # [seq_len, hidden_dim]
+
+                        if batch_idx == 0:
+                            print("Embedded protein {} with length {} to emb. of shape: {}".format(
+                                identifier, seq_len, emb.shape))
+
+                        # Save embedding with split name prefix
+                        embedding_path = os.path.join(emb_path, f"{identifier}.pkl.gz")
+                        with gzip.open(embedding_path, "wb") as f:
+                            pickle.dump({
+                                'representation': emb.detach().cpu().numpy().squeeze(),
+                                'pooling_type': pooling_type,
+                                'sequence_length': seq_len,
+                                'split': split_name
+                            }, f)
+                        processed_count += 1
+
+            except RuntimeError:
+                print(f"RuntimeError during embedding for {pdb_id} (L={seq_len}). Try lowering batch size.")
+                continue
+
+    end = time.time()
+    print(f'\n############# STATS for {split_name} #############')
+    print(f'Total time: {end - start:.2f}[s]')
+    print(f'Processed sequences: {processed_count}')
+    print(f'Skipped sequences: {skipped_count}')
+    print(f'Time per processed sequence: {(end - start) / processed_count:.4f}[s]')
+    print(f'Average sequence length: {avg_length:.2f}')
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description='Extract embeddings from protein sequences using various PLMs')
     
-    parser.add_argument('-i', '--input', required=True, type=str, help='Path to FASTA file containing protein sequence(s)')
+    # 添加新的参数组
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('-i', '--input', type=str, help='Path to FASTA file containing protein sequence(s)')
+    input_group.add_argument('--hf_dataset', type=str, help='Huggingface dataset name')
+    
+    parser.add_argument('--hf_split', type=str, default=None, 
+                       help='Dataset split to use. If not specified, process all splits (train, validation, test)')
+    parser.add_argument('--sequence_column', type=str, default='sequence', 
+                       help='Name of the column containing protein sequences')
+    parser.add_argument('--id_column', type=str, default='id', 
+                       help='Name of the column containing protein IDs')
+    
     parser.add_argument('-o', '--output', required=True, type=str, help='Path for saving the embeddings')
     parser.add_argument('--model_name_or_path', required=True, type=str, 
                         choices=[
@@ -236,24 +442,35 @@ def main():
     parser.add_argument('--total_chunks', type=int, help='Total number of chunks')
     args = parser.parse_args()
 
-    seq_path = Path(args.input)
     emb_path = Path(args.output)
     model_dir = Path(args.model_dir) if args.model_dir is not None else None
+    pooling_type = None if args.pooling_type == 'none' else args.pooling_type
 
     os.makedirs(emb_path, exist_ok=True)
     
-    # Convert 'none' to None for the pooling_type
-    pooling_type = None if args.pooling_type == 'none' else args.pooling_type
-
-    get_embeddings(
-        seq_path=seq_path,
-        emb_path=emb_path,
-        model_name_or_path=args.model_name_or_path,
-        model_dir=model_dir,
-        pooling_type=pooling_type,
-        chunk_id=args.chunk_id,
-        total_chunks=args.total_chunks
-    )
+    if args.hf_dataset:
+        get_embeddings_from_hf(
+            dataset_name=args.hf_dataset,
+            split=args.hf_split,
+            emb_path=emb_path,
+            model_name_or_path=args.model_name_or_path,
+            model_dir=model_dir,
+            pooling_type=pooling_type,
+            chunk_id=args.chunk_id,
+            total_chunks=args.total_chunks,
+            sequence_column=args.sequence_column,
+            id_column=args.id_column
+        )
+    else:
+        get_embeddings(
+            seq_path=Path(args.input),
+            emb_path=emb_path,
+            model_name_or_path=args.model_name_or_path,
+            model_dir=model_dir,
+            pooling_type=pooling_type,
+            chunk_id=args.chunk_id,
+            total_chunks=args.total_chunks
+        )
 
 if __name__ == '__main__':
     main() 

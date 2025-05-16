@@ -17,3 +17,21 @@ CUDA_VISIBLE_DEVICES=0 python get_plm_embed.py \
     --model_name_or_path Rostlab/prot_bert \
     --chunk_id 0 \
     --total_chunks 1
+
+# handle all splits
+python get_plm_embed.py \
+    --hf_dataset AI4Protein/DeepLocBinary \
+    --output results/DeepLocBinary/esm2_t30_150M_UR50D \
+    --model_name_or_path facebook/esm2_t30_150M_UR50D \
+    --id_column name \
+    --sequence_column aa_seq
+
+# handle specific split
+python get_plm_embed.py \
+    --hf_dataset AI4Protein/DeepLocBinary \
+    --hf_split train \
+    --output results/DeepLocBinary/train_esm2_t30_150M_UR50D \
+    --model_name_or_path facebook/esm2_t30_150M_UR50D \
+    --pooling_type mean \
+    --id_column name \
+    --sequence_column aa_seq
