@@ -52,8 +52,11 @@ def inference(args: DictConfig):
         deterministic=args.deterministic,
     )
 
+    task = args.training.task
     test_dataset = ProteinDataset(
         path_to_dataset=args.data.path_to_dataset,
+        num_classes=args.model.label_dim,
+        task=task,
         max_seq_len=args.data.max_seq_len,
         batch_size=args.batch_size,
         collate_fn=BatchTensorConverter(),
@@ -79,20 +82,21 @@ def inference(args: DictConfig):
         ).to(device)
         model_2.load_state_dict(torch.load(args.ckpt_dir.replace('_1.pt', '_2.pt'), map_location=device))
 
-        acc = val_iteration(
+        metrics = val_iteration(
             model,
             model_2,
             loader=test_dataloader,
             device=device,
         )
     else:
-        acc = baseline_val_iteration(
+        metrics = baseline_val_iteration(
             model,
             loader=test_dataloader,
+            task=task,
             device=device,
         )
 
-    logging.info(f"Accuracy: {acc}")
+    logging.info(f"Metrics on test set: {metrics}")
     # with open(f"{logging_dir}/{acc:.2f}.txt", "w") as f:
     #     f.write(f"Accuracy: {acc}")
 

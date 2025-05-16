@@ -5,10 +5,16 @@ seed: 37
 deterministic: False
 
 data:
-  path_to_dataset: './data/train'
-  max_seq_len: 10000
-  num_workers: 8
-  pin_memory: False
+  path_to_dataset: './data/test'
+  baseline: True
+  save_interval: 10
+  warmup_epochs: 10
+  p_threshold: 0.5
+  augmented_samples: 3
+  augment_mu: 0.0
+  augment_std: 1.0
+  sharpening_temp: 0.5
+  alpha: 0.5
 
 model:
     embedding_dim: 64
