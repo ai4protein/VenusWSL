@@ -1,7 +1,7 @@
 import copy
 import pickle
 from typing import Dict, Optional, List, Sequence, Callable
-
+import gzip
 import numpy as np
 import pandas as pd
 import torch
@@ -83,6 +83,7 @@ class DataAugment:
 class ProteinDataset(Dataset):
     def __init__(self,
         path_to_dataset: str,
+        embed_root: str,
         num_classes: int = 10,
         task: str = 'binary',
         min_seq_len: int = 20,
@@ -96,11 +97,14 @@ class ProteinDataset(Dataset):
         assert path_to_dataset.endswith('.csv'), 'Dataset must be in CSV format'
 
         self.data = pd.read_csv(path_to_dataset)
+        # map embedding_path to the embedding root
+        self.data['embedding_path'] = self.data['name'].apply(lambda x: f"{embed_root}/{x}.pkl.gz")
         if max_seq_len > 0:
             self.data = self.data[self.data['aa_seq'].apply(lambda x: len(x) < max_seq_len)]
         if min_seq_len > 0:
             self.data = self.data[self.data['aa_seq'].apply(lambda x: len(x) < max_seq_len)]
 
+        print(self.data)
         # sort by sequence length
         self.data = self.data.sort_values(by='aa_seq', key=lambda x: x.str.len(), ascending=False)
         self.data_to_iter = self.data.copy()
@@ -134,6 +138,14 @@ class ProteinDataset(Dataset):
         elif embedding_path.endswith('.pkl'):
             with open(embedding_path, 'rb') as f:
                 embedding = pickle.load(f)
+        elif embedding_path.endswith('.pkl.gz'):
+            with gzip.open(embedding_path, 'rb') as f:
+                embedding = pickle.load(f)
+
+        if 'representations' in embedding.keys():
+            embedding = embedding['representations']
+        else:
+            embedding = embedding['representation']
 
         data_object = {
             'label': label,

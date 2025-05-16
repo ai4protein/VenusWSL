@@ -30,6 +30,12 @@ We recommend using a GPU with at least 12GB memory.
 bash script/get_plm_embedding.sh
 ```
 
+### Prepare Dataset
+
+```bash
+bash script/prepare_dataset.sh
+```
+
 ### Train with VenusWSL
 
 ```bash

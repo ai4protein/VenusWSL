@@ -244,13 +244,12 @@ def get_embeddings_from_hf(dataset_name,
         for current_split in splits:
             try:
                 print(f"\nProcessing split: {current_split}")
-                current_emb_path = os.path.join(emb_path, current_split)
-                os.makedirs(current_emb_path, exist_ok=True)
+                os.makedirs(emb_path, exist_ok=True)
                 
                 dataset = load_dataset(dataset_name, split=current_split)
                 process_dataset_split(
                     dataset=dataset,
-                    emb_path=current_emb_path,
+                    emb_path=emb_path,
                     model_name_or_path=model_name_or_path,
                     model_dir=model_dir,
                     pooling_type=pooling_type,
@@ -335,7 +334,7 @@ def process_dataset_split(dataset,
         seq = example[sequence_column]
         
         # 检查embedding是否已存在
-        embedding_path = os.path.join(emb_path, f"{split_name}_{pdb_id}.pkl.gz")
+        embedding_path = os.path.join(emb_path, f"{pdb_id}.pkl.gz")
         if os.path.exists(embedding_path):
             skipped_count += 1
             continue

@@ -15,10 +15,10 @@ training:
   augment_std: 1.0
   sharpening_temp: 0.5
   alpha: 0.5
+  plm: "protbert"  # other model name, e.g. "ankh", "prot_t5"
 
 data:
   # dataset config
-  dataset_type: "hf"  # hf or local
   hf_dataset: "AI4Protein/DeepLocBinary"  # Huggingface dataset name
   sequence_column: "aa_seq"  # sequence column name
   id_column: "name"  # ID column name
@@ -33,6 +33,7 @@ data:
   shuffle: True
   num_workers: 32
   pin_memory: False
+  embed_root: "results"  # embedding root path
 
 model:
   embedding_dim: 64
