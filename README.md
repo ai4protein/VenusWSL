@@ -40,4 +40,8 @@ bash script/train.sh
 if you find this work useful, please cite:
 ```bibtex
 
-}
+```
+
+## 📝 License
+
+This project is licensed under the terms of the [CC-BY-NC-ND-4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode) license.
