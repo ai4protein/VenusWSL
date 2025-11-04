@@ -15,8 +15,8 @@ We present VenusWSL, a weakly supervised learning framework that addresses label
 Please make sure you have installed [Anaconda3](https://www.anaconda.com/download/) or [Miniconda3](https://docs.conda.io/en/latest/miniconda.html).
 
 ```bash
-conda env create -f environment.yml
-conda activate venuswsl
+conda env create -f environment.yaml
+conda activate protein
 ```
 
 ### Hardware
@@ -27,7 +27,7 @@ We recommend using a GPU with at least 12GB memory.
 ### Get PLM Embedding
 
 ```bash
-bash script/get_plm_embedding.sh
+bash script/get_plm_embed.sh
 ```
 
 ### Prepare Dataset

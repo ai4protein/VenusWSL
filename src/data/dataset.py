@@ -107,6 +107,7 @@ class ProteinDataset(Dataset):
         print(self.data)
         # sort by sequence length
         self.data = self.data.sort_values(by='aa_seq', key=lambda x: x.str.len(), ascending=False)
+        self.data = self.data.reset_index(drop=True)
         self.data_to_iter = self.data.copy()
         self.pred = None
 
